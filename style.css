@@ -1,0 +1,229 @@
+/* 캐릭터창 필름스트립 */
+.ma-strip {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+    margin: 5px 0;
+}
+
+.ma-tile {
+    position: relative;
+    width: 40px;
+    height: 60px;
+    border: 2px solid transparent;
+    border-radius: 5px;
+    overflow: hidden;
+    cursor: pointer;
+    opacity: 0.75;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+
+.ma-tile:hover {
+    opacity: 1;
+}
+
+/* 캐릭터 목록에 쓰이는 이미지 */
+.ma-tile.selected {
+    border-color: var(--golden);
+    opacity: 1;
+}
+
+.ma-tile img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+/* 캐릭터 기본값 표시 */
+.ma-badge {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: var(--golden);
+    color: #000;
+    font-size: 0.6em;
+    font-weight: bold;
+    line-height: 1.3;
+    pointer-events: none;
+}
+
+/* 파일이 사라진 이미지 */
+.ma-missing {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    min-height: 60px;
+    background: var(--black30a);
+    color: var(--warning, #d9822b);
+}
+
+/* 선택 표시. 이미지를 가리지 않도록 모서리에 작게 붙인다 */
+.ma-check {
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    background: var(--golden);
+    color: #000;
+    font-size: 0.6em;
+    box-shadow: 0 0 3px rgba(0, 0, 0, 0.8);
+    pointer-events: none;
+}
+
+.ma-tile.selected .ma-check,
+.ma-picker-item.active .ma-check {
+    display: flex;
+}
+
+/* 드롭다운은 썸네일 아래에 파일명이 있어, 썸네일을 감싸 그 안에 표식을 둔다 */
+.ma-thumb {
+    position: relative;
+    width: 100%;
+    line-height: 0;
+}
+
+/* 글리프는 작게 두되 손가락이 닿을 면적을 확보한다 */
+.ma-tile .ma-del {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-bottom-left-radius: 6px;
+    background: rgba(0, 0, 0, 0.65);
+    font-size: 0.7em;
+    opacity: 0;
+}
+
+.ma-tile:hover .ma-del {
+    opacity: 1;
+}
+
+/*
+ * 터치 기기에는 hover가 없어 삭제 버튼이 영영 나타나지 않는다.
+ * 항상 보이게 하고, 타일과 적중 영역을 손가락에 맞게 키운다.
+ * 1000px는 SillyTavern이 모바일 레이아웃으로 바뀌는 폭이라 함께 묶는다.
+ */
+@media (hover: none), (max-width: 1000px) {
+    .ma-strip {
+        gap: 8px;
+    }
+
+    .ma-tile {
+        width: 64px;
+        height: 96px;
+        opacity: 1;
+    }
+
+    .ma-tile .ma-del {
+        width: 30px;
+        height: 30px;
+        font-size: 0.9em;
+        opacity: 1;
+    }
+
+    .ma-check {
+        width: 20px;
+        height: 20px;
+        font-size: 0.7em;
+    }
+
+    /* 드롭다운 항목도 같은 이유로 넓힌다 */
+    .ma-picker-item {
+        width: 64px;
+    }
+
+    .ma-picker-item img,
+    .ma-picker-none {
+        height: 85px;
+    }
+}
+
+/* 이미지 추가 타일 */
+.ma-tile.ma-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--SmartThemeBorderColor);
+}
+
+/* 채팅 메시지의 이미지 선택 드롭다운 */
+.ma-picker {
+    position: fixed;
+    z-index: 10000;
+    display: flex;
+    gap: 5px;
+    padding: 6px;
+    max-width: 90vw;
+    overflow-x: auto;
+    background: var(--SmartThemeBlurTintColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.ma-picker-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    width: 50px;
+    padding: 3px;
+    border: 2px solid transparent;
+    border-radius: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.ma-picker-item:hover {
+    background: var(--white20a);
+}
+
+.ma-picker-item.active {
+    border-color: var(--golden);
+}
+
+.ma-picker-item img,
+.ma-picker-none {
+    width: 100%;
+    height: 66px;
+    object-fit: cover;
+    border-radius: 3px;
+}
+
+.ma-picker-none {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--black30a);
+}
+
+/* 파일명은 길어질 수 있어 한 줄로 자름 */
+.ma-picker-item span {
+    font-size: 0.7em;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ma-status {
+    margin-top: 5px;
+    font-size: 0.85em;
+    opacity: 0.8;
+}
