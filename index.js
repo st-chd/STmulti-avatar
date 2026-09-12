@@ -29,12 +29,14 @@ async function writeCard(key, data) {
         const personas = settings.personas ??= {};
         if (data === undefined) delete personas[avatarFile(key)];
         else personas[avatarFile(key)] = data;
+        if (!Object.keys(personas).length) delete settings.personas;
+        if (!Object.keys(settings).length) delete c.extensionSettings[KEY];
         c.saveSettingsDebounced();
         return;
     }
     const id = charIndex(key);
     if (id < 0) return;
-    await ctx().writeExtensionField(id, KEY, data);
+    await ctx().writeExtensionField(id, KEY, data === undefined ? ctx().constants.unset : data);
 }
 
 /** 채팅별 선택값. undefined는 미설정, 빈 문자열은 원본 고정. */
@@ -45,9 +47,17 @@ async function setChatOverride(key, value) {
     const map = { ...(c.chatMetadata?.[KEY] ?? {}) };
     if (value === undefined) delete map[key];
     else map[key] = value;
-    c.updateChatMetadata({ [KEY]: map });
+    replaceChatMap(map);
     await c.saveMetadata();
     refresh();
+}
+
+function replaceChatMap(map) {
+    const c = ctx();
+    const metadata = { ...c.chatMetadata };
+    if (Object.keys(map).length) metadata[KEY] = map;
+    else delete metadata[KEY];
+    c.updateChatMetadata(metadata, true);
 }
 
 /** 표시할 파일명. 삭제된 파일과 null은 원본으로 처리한다. */
@@ -126,17 +136,22 @@ function avatarKeyOf(src) {
 /** 이미지 교체 전에 로드 가능 여부를 확인해 아바타가 사라지는 것을 막는다. */
 const probed = new Map();
 function probe(url) {
-    if (probed.has(url)) return probed.get(url);
+    const cached = probed.get(url);
+    if (cached && cached.expires > Date.now()) return cached.promise;
 
+    const entry = { expires: Infinity };
     const p = new Promise((res) => {
         const t = new Image();
         t.onload = () => res(true);
         t.onerror = () => res(false);
         t.src = url;
     });
-    // 일시적 실패는 다음 시도에서 다시 확인한다.
-    p.then((ok) => { if (!ok) probed.delete(url); });
-    probed.set(url, p);
+    // 없는 파일은 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다.
+    p.then((ok) => { if (!ok) entry.expires = Date.now() + 30_000; });
+    entry.promise = p;
+    probed.delete(url);
+    if (probed.size >= 256) probed.delete(probed.keys().next().value);
+    probed.set(url, entry);
     return p;
 }
 
@@ -211,7 +226,7 @@ function swap(root, mode) {
                 img.src = wantUrl;
                 syncThemeVars(img, wantUrl);
             } else {
-                img.src = img.dataset.maOrig;
+                if (!sameUrl(img.getAttribute('src'), img.dataset.maOrig)) img.src = img.dataset.maOrig;
                 delete img.dataset.maApplied;
                 syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
             }
@@ -242,7 +257,7 @@ function refresh() {
 /** 추가 이미지가 있는 메시지에만 선택 버튼을 표시한다. */
 function syncMesButtons(root) {
     if (!root) return;
-        const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
+    const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
     for (const mes of list) {
         const key = mes.querySelector('.avatar img')?.dataset.maKey;
         const wanted = !!key && mes.getAttribute('is_system') !== 'true'
@@ -403,7 +418,9 @@ function renderPanelStrip(prefix, key) {
 }
 
 async function setListImage(key, file) {
-    const d = cardData(key) ?? { files: [] };
+    const existing = cardData(key);
+    if ((!existing && file === null) || existing?.list === file) return;
+    const d = existing ?? { files: [] };
     await writeCard(key, { ...d, list: file });
     renderStrip();
     refresh();
@@ -438,28 +455,52 @@ async function cropToPng(dataUrl, crop) {
 function pickFile() {
     return new Promise((res) => {
         const input = Object.assign(document.createElement('input'), { type: 'file', accept: 'image/*' });
-        input.onchange = () => res(input.files?.[0] ?? null);
-        input.oncancel = () => res(null);
+        const finish = file => { input.remove(); res(file); };
+        input.hidden = true;
+        input.onchange = () => finish(input.files?.[0] ?? null);
+        input.oncancel = () => finish(null);
+        document.body.append(input);
         input.click();
     });
 }
 
 async function addImage(key) {
+    if (uploading) return;
+    uploading = true;
+    try {
+        await uploadImage(key);
+    } catch (error) {
+        console.error('[Multi Avatar] 업로드 실패', error);
+        toastr.error('이미지 업로드에 실패했습니다.');
+    } finally {
+        uploading = false;
+    }
+}
+
+let uploading = false;
+
+async function uploadImage(key) {
     const file = await pickFile();
     if (!file) return;
 
     const { Popup, POPUP_TYPE } = ctx();
     const dataUrl = await readAsDataUrl(file);
 
-    const dlg = new Popup('이미지 자르기', POPUP_TYPE.CROP, '', { cropImage: dataUrl });
-    if (!await dlg.show()) return;
+    let crop;
+    if (!ctx().powerUserSettings.never_resize_avatars) {
+        const dlg = new Popup('이미지 자르기', POPUP_TYPE.CROP, '', { cropImage: dataUrl });
+        if (!await dlg.show()) return;
+        crop = dlg.cropData;
+    }
 
     const d = cardData(key) ?? { files: [], list: null };
     const dir = dirOf(key);
-    const base = dir.replace(/\.[^.]+$/, '').replace(/\./g, '_');
+    assertPathPart(dir);
+    const base = dir.replace(/\./g, '_');
 
     // 실제 폴더도 확인해 기존 파일을 덮어쓰지 않는다.
-    const onDisk = await post('/api/images/list', { folder: dir }) ?? [];
+    const onDisk = await cleanupRequest('/api/images/list', { folder: dir });
+    if (!Array.isArray(onDisk)) throw new Error('이미지 목록 응답이 올바르지 않습니다.');
     const taken = new Set([...(d.files ?? []), ...onDisk]);
     let n = 1;
     while (taken.has(`${base}_add${n}.png`)) n++;
@@ -468,7 +509,7 @@ async function addImage(key) {
         method: 'POST',
         headers: ctx().getRequestHeaders(),
         body: JSON.stringify({
-            image: await cropToPng(dataUrl, dlg.cropData),
+            image: await cropToPng(dataUrl, crop),
             format: 'png',
             filename: `${base}_add${n}`,
             ch_name: dir,
@@ -489,11 +530,12 @@ async function deleteImage(key, file) {
     await deleteFolder(dirOf(key), [file]);
     probed.clear();
 
-    await writeCard(key, {
+    const files = (d.files ?? []).filter(f => f !== file);
+    await writeCard(key, files.length ? {
         ...d,
-        files: (d.files ?? []).filter(f => f !== file),
+        files,
         list: d.list === file ? null : d.list,
-    });
+    } : undefined);
 
     if (chatOverride(key) === file) {
         await setChatOverride(key, undefined);
@@ -505,14 +547,23 @@ async function deleteImage(key, file) {
 
 /** 폴더의 지정한 파일만 삭제한다. */
 async function deleteFolder(dir, files) {
-    await Promise.all((files ?? []).map(async f => {
+    assertPathPart(dir);
+    for (const file of files ?? []) assertPathPart(file);
+    for (const f of files ?? []) {
         const response = await fetch('/api/images/delete', {
             method: 'POST',
             headers: ctx().getRequestHeaders(),
             body: JSON.stringify({ path: `${IMG_ROOT}/${dir}/${f}` }),
         });
         if (!response.ok && response.status !== 404) throw new Error(`이미지 삭제 실패: ${f}`);
-    }));
+    }
+}
+
+function assertPathPart(value) {
+    if (typeof value !== 'string' || !value || value === '.' || value === '..'
+        || /[\\/\u0000-\u001f<>:"|?*]/.test(value) || /[. ]$/.test(value)) {
+        throw new Error('추가 이미지 경로가 올바르지 않습니다.');
+    }
 }
 
 /** 캐릭터 카드에 등록된 추가 이미지를 삭제한다. */
@@ -538,11 +589,15 @@ async function purgePersonas() {
     ctx().saveSettingsDebounced();
 }
 
-const post = (url, body) => fetch(url, {
-    method: 'POST',
-    headers: ctx().getRequestHeaders(),
-    body: JSON.stringify(body),
-}).then(r => r.ok ? r.json().catch(() => null) : null);
+async function purgeCards() {
+    const c = ctx();
+    if (typeof c.constants?.unset !== 'string') throw new Error('카드 데이터 삭제 API를 사용할 수 없습니다.');
+    const expected = c.characters.filter(ch => ch?.data?.extensions?.[KEY] !== undefined).map(ch => ch.avatar);
+    const result = await c.writeExtensionFieldBulk([], KEY, c.constants.unset);
+    if (!result || result.failed?.length || expected.some(avatar => !result.updated?.includes(avatar))) {
+        throw new Error('일부 캐릭터 카드 데이터를 삭제하지 못했습니다.');
+    }
+}
 
 /** 채팅 헤더에서 선택한 종류의 이미지 설정만 제거한다. */
 function stripMeta(chat, scope = 'all') {
@@ -574,7 +629,19 @@ async function cleanupRequest(url, body) {
 /** 선택한 종류의 이미지, 설정, 채팅 선택 정보를 정리한다. */
 async function purgeAll(log, scope = 'all') {
     const c = ctx();
-    const chars = c.characters ?? [];
+    if (uploading) throw new Error('이미지 업로드가 끝난 뒤 정리해 주세요.');
+    if (scope !== 'persona' && typeof c.constants?.unset !== 'string') {
+        throw new Error('카드 데이터 삭제 API를 사용할 수 없습니다.');
+    }
+    // 지연 로드된 카드도 먼저 읽어 파일 목록을 놓치지 않는다.
+    if (scope !== 'persona') {
+        for (let id = 0; id < c.characters.length; id++) {
+            if (!ctx().characters[id]?.shallow) continue;
+            await c.unshallowCharacter(id);
+            if (ctx().characters[id]?.shallow) throw new Error('캐릭터 데이터를 불러오지 못했습니다.');
+        }
+    }
+    const chars = ctx().characters ?? [];
 
     log('이미지 파일 삭제 중...');
     if (scope !== 'persona') {
@@ -584,7 +651,7 @@ async function purgeAll(log, scope = 'all') {
 
     if (scope !== 'persona') {
         log('캐릭터 카드 정리 중...');
-        await c.writeExtensionFieldBulk([], KEY, c.unset);
+        await purgeCards();
     }
 
     let done = 0;
@@ -614,7 +681,7 @@ async function purgeAll(log, scope = 'all') {
 
     const current = { chat_metadata: { [KEY]: { ...(c.chatMetadata?.[KEY] ?? {}) } } };
     if (stripMeta([current], scope)) {
-        c.updateChatMetadata({ [KEY]: current.chat_metadata[KEY] ?? {} });
+        replaceChatMap(current.chat_metadata[KEY] ?? {});
         await c.saveMetadata();
     }
     probed.clear();
@@ -624,12 +691,9 @@ async function purgeAll(log, scope = 'all') {
         : `${scope === 'persona' ? '페르소나' : '캐릭터'} 추가 이미지와 관련 설정 정리가 완료되었습니다.`);
 }
 
-/** 확장 삭제 훅에서는 이미지와 설정만 빠르게 정리한다. */
+/** 확장 삭제 시에도 채팅 선택 정보를 포함해 동일하게 정리한다. */
 export async function cleanUp() {
-    const c = ctx();
-    for (const ch of c.characters ?? []) await deleteCardImages(ch);
-    await purgePersonas();
-    await c.writeExtensionFieldBulk([], KEY, c.unset);
+    await purgeAll(() => {});
 }
 
 function addSettings() {
@@ -754,7 +818,7 @@ jQuery(async () => {
 
     eventSource.on(event_types.CHARACTER_DUPLICATED, async ({ newAvatar }) => {
         await ctx().getCharacters();
-        if (cardData(newAvatar)) await writeCard(newAvatar, { files: [], list: null });
+        if (cardData(newAvatar)) await writeCard(newAvatar, undefined);
     });
 
     // 구버전 데이터는 이름 변경 전 키를 폴더명으로 보존한다.
