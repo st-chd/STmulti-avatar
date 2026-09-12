@@ -55,8 +55,5 @@
 
 페르소나의 추가 이미지와 확장 설정도 함께 정리합니다.
 
-## 개발 검증
-
-개발 의존성을 설치한 뒤 `npm test`로 Playwright 브라우저 검사를 실행합니다. Windows에서는 설치된 Microsoft Edge를 사용하고, 다른 운영체제에서는 Playwright Chromium을 사용합니다(`npx playwright install chromium`). `MA_BROWSER_CHANNEL` 환경변수로 브라우저 채널을 지정할 수 있습니다.
-
-검사는 실제 확장 코드와 SillyTavern CSS를 로드하고 원본 미리보기, 네 가지 프로필 스타일, 페르소나/캐릭터 분리, 채팅 선택, 업로드 PNG 변환, 삭제 및 기존 폴더 호환성을 확인합니다. 서버 API는 테스트 응답으로 대체하므로 실제 사용자 파일을 변경하지 않습니다.
+---
+이 확장프로그램은 GPT와 Claude의 도움으로 만들어졌습니다.
