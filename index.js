@@ -39,6 +39,39 @@ async function writeCard(key, data) {
     await ctx().writeExtensionField(id, KEY, data === undefined ? ctx().constants.unset : data);
 }
 
+let importGuardCleanup = null;
+
+function installImportGuard() {
+    if (importGuardCleanup) return;
+    const originalFetch = window.fetch;
+    let active = true;
+    // 현재 실리태번에는 카드 불러오기 이벤트가 없어 목록 갱신 전에 새 카드의 설정만 분리한다.
+    const guardedFetch = async function (input, options) {
+        const response = await originalFetch.call(this, input, options);
+        if (!active || !response.ok || !(options?.body instanceof FormData)
+            || options.body.get('preserved_name')) return response;
+        const url = new URL(input instanceof Request ? input.url : input, location.origin);
+        if (url.origin !== location.origin || url.pathname !== '/api/characters/import') return response;
+        const imported = await response.clone().json();
+        if (imported.error || !imported.file_name) return response;
+
+        const avatar = `${imported.file_name}.png`;
+        const c = ctx();
+        const result = await c.writeExtensionFieldBulk([avatar], KEY, c.constants.unset);
+        if (!result || result.failed?.length
+            || ![...(result.updated ?? []), ...(result.skipped ?? [])].includes(avatar)) {
+            throw new Error('불러온 캐릭터의 추가 이미지 설정을 분리하지 못했습니다.');
+        }
+        return response;
+    };
+    window.fetch = guardedFetch;
+    importGuardCleanup = () => {
+        active = false;
+        if (window.fetch === guardedFetch) window.fetch = originalFetch;
+        importGuardCleanup = null;
+    };
+}
+
 /** 채팅별 선택값. undefined는 미설정, 빈 문자열은 원본 고정. */
 const chatOverride = (key) => ctx().chatMetadata?.[KEY]?.[key];
 
@@ -76,6 +109,10 @@ function resolve(key, mode) {
 /** 이미지 폴더명. 구버전 데이터는 파일명에서 기존 폴더를 추론한다. */
 function dirOf(key) {
     const d = cardData(key);
+    return imageDir(key, d);
+}
+
+function imageDir(key, d) {
     if (d?.dir) return d.dir;
     const m = /^(.*)_add\d+\.[^.]+$/.exec(d?.files?.[0] ?? '');
     if (m) return `${m[1]}.png`;
@@ -511,7 +548,8 @@ async function uploadImage(key) {
         body: JSON.stringify({
             image: await cropToPng(dataUrl, crop),
             format: 'png',
-            filename: `${base}_add${n}`,
+            // 삭제 후 같은 경로를 재사용하면 브라우저가 이전 크롭 이미지를 보여줄 수 있다.
+            filename: `${base}_add${n}_${crypto.randomUUID()}`,
             ch_name: dir,
         }),
     });
@@ -527,7 +565,7 @@ async function deleteImage(key, file) {
     if (!await ctx().Popup.show.confirm('이미지 삭제', `${file} 을(를) 삭제할까요?`)) return;
 
     const d = cardData(key) ?? { files: [], list: null };
-    await deleteFolder(dirOf(key), [file]);
+    await deleteUnreferencedImages(dirOf(key), [file], new Set([key]));
     probed.clear();
 
     const files = (d.files ?? []).filter(f => f !== file);
@@ -566,24 +604,47 @@ function assertPathPart(value) {
     }
 }
 
-/** 캐릭터 카드에 등록된 추가 이미지를 삭제한다. */
-function deleteCardImages(char) {
-    const d = char?.data?.extensions?.[KEY];
-    if (!d?.files?.length) return Promise.resolve();
-    const legacy = /^(.*)_add\d+\.[^.]+$/.exec(d.files[0]);
-    return deleteFolder(d.dir || (legacy ? `${legacy[1]}.png` : char.avatar), d.files);
+/** PNG 재불러오기로 공유된 파일은 다른 카드나 페르소나가 사용하는 동안 보존한다. */
+async function deleteUnreferencedImages(dir, files, excludedKeys) {
+    if (!files?.length) return;
+    const c = ctx();
+    for (let id = 0; id < c.characters.length; id++) {
+        const ch = ctx().characters[id];
+        if (!ch?.shallow || excludedKeys.has(ch.avatar)) continue;
+        await c.unshallowCharacter(id);
+        if (ctx().characters[id]?.shallow) throw new Error('이미지 참조를 확인할 캐릭터 데이터를 불러오지 못했습니다.');
+    }
+    const referenced = new Set();
+    const collect = (key, data) => {
+        if (excludedKeys.has(key) || imageDir(key, data) !== dir) return;
+        for (const file of data?.files ?? []) referenced.add(file);
+    };
+    for (const ch of ctx().characters) {
+        if (ch?.avatar) collect(ch.avatar, ch.data?.extensions?.[KEY]);
+    }
+    for (const [file, data] of Object.entries(ctx().extensionSettings[KEY]?.personas ?? {})) {
+        collect(personaKey(file), data);
+    }
+    await deleteFolder(dir, files.filter(file => !referenced.has(file)));
 }
 
-async function deletePersonaImages(file) {
+/** 캐릭터 카드에 등록된 추가 이미지를 삭제한다. */
+function deleteCardImages(char, excludedKeys = new Set([char.avatar])) {
+    const d = char?.data?.extensions?.[KEY];
+    if (!d?.files?.length) return Promise.resolve();
+    return deleteUnreferencedImages(imageDir(char.avatar, d), d.files, excludedKeys);
+}
+
+async function deletePersonaImages(file, excludedKeys = new Set([personaKey(file)])) {
     const key = personaKey(file);
     const data = cardData(key);
-    if (data?.files?.length) await deleteFolder(dirOf(key), data.files);
+    if (data?.files?.length) await deleteUnreferencedImages(dirOf(key), data.files, excludedKeys);
     await writeCard(key, undefined);
 }
 
-async function purgePersonas() {
+async function purgePersonas(excludedKeys) {
     for (const file of Object.keys(ctx().extensionSettings[KEY]?.personas ?? {})) {
-        await deletePersonaImages(file);
+        await deletePersonaImages(file, excludedKeys);
     }
     delete ctx().extensionSettings[KEY];
     ctx().saveSettingsDebounced();
@@ -642,12 +703,16 @@ async function purgeAll(log, scope = 'all') {
         }
     }
     const chars = ctx().characters ?? [];
+    const excludedKeys = new Set([
+        ...(scope !== 'persona' ? chars.map(ch => ch.avatar) : []),
+        ...(scope !== 'character' ? Object.keys(c.extensionSettings[KEY]?.personas ?? {}).map(personaKey) : []),
+    ]);
 
     log('이미지 파일 삭제 중...');
     if (scope !== 'persona') {
-        for (const ch of chars) await deleteCardImages(ch);
+        for (const ch of chars) await deleteCardImages(ch, excludedKeys);
     }
-    if (scope !== 'character') await purgePersonas();
+    if (scope !== 'character') await purgePersonas(excludedKeys);
 
     if (scope !== 'persona') {
         log('캐릭터 카드 정리 중...');
@@ -694,6 +759,7 @@ async function purgeAll(log, scope = 'all') {
 /** 확장 삭제 시에도 채팅 선택 정보를 포함해 동일하게 정리한다. */
 export async function cleanUp() {
     await purgeAll(() => {});
+    importGuardCleanup?.();
 }
 
 function addSettings() {
@@ -777,6 +843,7 @@ function addImageDrawer(anchor, prefix) {
 jQuery(async () => {
     const { eventSource, event_types } = ctx();
 
+    installImportGuard();
     addSettings();
     addImageDrawer(document.getElementById('avatar_div'), 'ma');
     addImageDrawer(document.querySelector('.persona_management_global_settings'), 'ma_persona');
