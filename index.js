@@ -47,21 +47,43 @@ function installImportGuard() {
     let active = true;
     // 현재 실리태번에는 카드 불러오기 이벤트가 없어 목록 갱신 전에 새 카드의 설정만 분리한다.
     const guardedFetch = async function (input, options) {
-        const response = await originalFetch.call(this, input, options);
-        if (!active || !response.ok || !(options?.body instanceof FormData)
-            || options.body.get('preserved_name')) return response;
         const url = new URL(input instanceof Request ? input.url : input, location.origin);
-        if (url.origin !== location.origin || url.pathname !== '/api/characters/import') return response;
-        const imported = await response.clone().json();
+        const isImport = active && options?.body instanceof FormData
+            && url.origin === location.origin && url.pathname === '/api/characters/import';
+        const preservedName = isImport && options.body.get('preserved_name');
+        // Assets의 신규 설치에도 preserved_name이 전달되므로 요청 전에 기존 카드 여부를 확인한다.
+        const replacing = typeof preservedName === 'string' && preservedName
+            && charIndex(`${preservedName.replace(/\.[^.]*$/, '')}.png`) >= 0;
+        const response = await originalFetch.call(this, input, options);
+        if (!active || !isImport || replacing || !response.ok) return response;
+        const imported = await response.clone().json().catch(() => null);
+        if (!imported) return response;
         if (imported.error || !imported.file_name) return response;
 
         const avatar = `${imported.file_name}.png`;
-        const c = ctx();
-        const result = await c.writeExtensionFieldBulk([avatar], KEY, c.constants.unset);
-        if (!result || result.failed?.length
-            || ![...(result.updated ?? []), ...(result.skipped ?? [])].includes(avatar)) {
-            throw new Error('불러온 캐릭터의 추가 이미지 설정을 분리하지 못했습니다.');
+        let separationError;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (!active) return response;
+            try {
+                const c = ctx();
+                const result = await c.writeExtensionFieldBulk([avatar], KEY, c.constants.unset);
+                if (!result || result.failed?.length
+                    || ![...(result.updated ?? []), ...(result.skipped ?? [])].includes(avatar)) {
+                    throw new Error('불러온 캐릭터의 추가 이미지 설정을 분리하지 못했습니다.');
+                }
+                return response;
+            } catch (error) {
+                separationError = error;
+            }
         }
+        // 카드는 이미 생성되었으므로 성공 응답을 유지해 본체의 손상 오류와 중복 불러오기를 막는다.
+        console.error('[Multi Avatar] 카드 생성 후 설정 분리 실패', avatar, separationError);
+        try {
+            await ctx().getCharacters();
+        } catch (error) {
+            console.error('[Multi Avatar] 생성된 캐릭터 목록 동기화 실패', error);
+        }
+        toastr.warning('캐릭터 생성은 성공했지만 추가 이미지 설정 분리에 실패했습니다. 다시 불러오지 말고 해당 카드의 추가 이미지 설정을 확인해 주세요.', 'Multi Avatar', { timeOut: 10000 });
         return response;
     };
     window.fetch = guardedFetch;
@@ -549,7 +571,7 @@ async function uploadImage(key) {
             image: await cropToPng(dataUrl, crop),
             format: 'png',
             // 삭제 후 같은 경로를 재사용하면 브라우저가 이전 크롭 이미지를 보여줄 수 있다.
-            filename: `${base}_add${n}_${crypto.randomUUID()}`,
+            filename: `${base}_add${n}_${ctx().uuidv4()}`,
             ch_name: dir,
         }),
     });
@@ -604,13 +626,15 @@ function assertPathPart(value) {
     }
 }
 
+const deletedCharacters = new WeakSet();
+
 /** PNG 재불러오기로 공유된 파일은 다른 카드나 페르소나가 사용하는 동안 보존한다. */
 async function deleteUnreferencedImages(dir, files, excludedKeys) {
     if (!files?.length) return;
     const c = ctx();
     for (let id = 0; id < c.characters.length; id++) {
         const ch = ctx().characters[id];
-        if (!ch?.shallow || excludedKeys.has(ch.avatar)) continue;
+        if (!ch?.shallow || deletedCharacters.has(ch) || excludedKeys.has(ch.avatar)) continue;
         await c.unshallowCharacter(id);
         if (ctx().characters[id]?.shallow) throw new Error('이미지 참조를 확인할 캐릭터 데이터를 불러오지 못했습니다.');
     }
@@ -620,7 +644,7 @@ async function deleteUnreferencedImages(dir, files, excludedKeys) {
         for (const file of data?.files ?? []) referenced.add(file);
     };
     for (const ch of ctx().characters) {
-        if (ch?.avatar) collect(ch.avatar, ch.data?.extensions?.[KEY]);
+        if (ch?.avatar && !deletedCharacters.has(ch)) collect(ch.avatar, ch.data?.extensions?.[KEY]);
     }
     for (const [file, data] of Object.entries(ctx().extensionSettings[KEY]?.personas ?? {})) {
         collect(personaKey(file), data);
@@ -881,7 +905,11 @@ jQuery(async () => {
         renderStrip();
     });
 
-    eventSource.on(event_types.CHARACTER_DELETED, ({ character }) => deleteCardImages(character));
+    eventSource.on(event_types.CHARACTER_DELETED, async ({ character }) => {
+        // 본체는 일괄 삭제가 끝날 때 배열을 갱신하므로 이미 삭제된 객체는 참조 검사에서 제외한다.
+        deletedCharacters.add(character);
+        await deleteCardImages(character);
+    });
 
     eventSource.on(event_types.CHARACTER_DUPLICATED, async ({ newAvatar }) => {
         await ctx().getCharacters();
