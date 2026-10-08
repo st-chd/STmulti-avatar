@@ -60,7 +60,7 @@ function pruneLibraries() {
     if (renamed) {
         let changed = false;
         for (const [oldAvatar, newAvatar] of Object.entries(renamed)) {
-            if (!alive.has(newAvatar) || alive.has(oldAvatar)) { delete renamed[oldAvatar]; changed = true; }
+            if (!alive.has(newAvatar)) { delete renamed[oldAvatar]; changed = true; }
         }
         if (!Object.keys(renamed).length) delete ctx().extensionSettings[KEY].renamed;
         if (changed) ctx().saveSettingsDebounced();
@@ -304,7 +304,7 @@ function installImportGuard() {
 
 /** 채팅별 선택값. undefined는 미설정, 빈 문자열은 원본 고정. */
 const chatKeys = key => [key, ...Object.entries(ctx().extensionSettings[KEY]?.renamed ?? {})
-    .filter(([oldAvatar, newAvatar]) => newAvatar === key && charIndex(oldAvatar) < 0).map(([oldAvatar]) => oldAvatar)];
+    .filter(([, newAvatar]) => newAvatar === key).map(([oldAvatar]) => oldAvatar)];
 const chatOverride = key => {
     const map = ctx().chatMetadata?.[KEY];
     const storedKey = chatKeys(key).find(candidate => map && Object.hasOwn(map, candidate));
@@ -1300,17 +1300,18 @@ jQuery(async () => {
         await handleAction(() => mutate(async () => {
             resetMarks();
             const d = await loadLibrary(oldAvatar);
-            if (!d?.files?.length) return;
-            adoptLegacyImages(oldAvatar, d);
-            const data = { ...d, dir: imageDir(oldAvatar, d) };
-            const result = await ctx().writeExtensionFieldBulk([newAvatar], KEY, data);
-            if (!result?.updated?.includes(newAvatar)) throw new Error('이름 변경 후 이미지 설정을 저장하지 못했습니다.');
+            if (d?.files?.length) {
+                adoptLegacyImages(oldAvatar, d);
+                const data = { ...d, dir: imageDir(oldAvatar, d) };
+                const result = await ctx().writeExtensionFieldBulk([newAvatar], KEY, data);
+                if (!result?.updated?.includes(newAvatar)) throw new Error('이름 변경 후 이미지 설정을 저장하지 못했습니다.');
+                cacheLibrary(newAvatar, data, undefined);
+            }
             libraries.delete(oldAvatar);
-            const settings = ctx().extensionSettings[KEY];
+            const settings = ctx().extensionSettings[KEY] ??= {};
             if (settings?.index) delete settings.index[oldAvatar];
-            cacheLibrary(newAvatar, data, undefined);
-            // 과거 채팅을 덮어쓰지 않고 이전 이름의 선택을 새 키로 읽는다.
-            const renamed = ctx().extensionSettings[KEY].renamed ??= {};
+            // 추가 이미지가 없어도 과거 채팅의 원본 고정 선택을 이전 이름으로 읽는다.
+            const renamed = settings.renamed ??= {};
             for (const key of Object.keys(renamed)) if (renamed[key] === oldAvatar) renamed[key] = newAvatar;
             delete renamed[newAvatar];
             renamed[oldAvatar] = newAvatar;
