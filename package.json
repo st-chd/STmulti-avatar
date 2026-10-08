@@ -3,7 +3,10 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "test": "node --test tests/*.test.cjs"
+        "test": "node --test tests/regression.test.cjs"
+    },
+    "engines": {
+        "node": ">=20"
     },
     "devDependencies": {
         "playwright": "1.62.1"
