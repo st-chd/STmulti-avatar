@@ -5,8 +5,10 @@
 
 import { user_avatar } from '../../../personas.js';
 import { isGenerating, saveSettings } from '../../../../script.js';
+import { deleteExtension } from '../../../extensions.js';
 
 const KEY = 'multiAvatar';
+const EXTENSION_NAME = decodeURIComponent(new URL(import.meta.url).pathname.split('/').at(-2));
 const IMG_ROOT = 'user/images';
 const PERSONA_PREFIX = 'persona:';
 const isPersona = key => key.startsWith(PERSONA_PREFIX);
@@ -1143,6 +1145,36 @@ export async function cleanUp() {
     importGuardCleanup?.();
 }
 
+async function runExtensionAction(button) {
+    const buttons = button.closest('.extension_block').querySelectorAll('.btn_clean, .btn_delete');
+    buttons.forEach(item => item.disabled = true);
+    try {
+        const c = ctx();
+        const deleting = button.classList.contains('btn_delete');
+        let cleanup = true;
+        if (deleting) {
+            const popup = new c.Popup('멀티 아바타 확장을 삭제하시겠습니까?', c.POPUP_TYPE.CONFIRM, '', {
+                customInputs: [{ id: 'extension_delete_cleanup', label: '확장 데이터도 정리', defaultState: false }],
+            });
+            if (await popup.show() !== c.POPUP_RESULT.AFFIRMATIVE) return;
+            cleanup = Boolean(popup.inputResults.get('extension_delete_cleanup'));
+        } else if (!await c.Popup.show.confirm('확장 데이터 정리', '멀티 아바타의 추가 이미지와 설정을 영구 삭제합니다. 계속하시겠습니까?')) {
+            return;
+        }
+
+        // 본체의 정리 훅은 5초 뒤 대기를 끝내므로 UI에서는 정리가 끝난 다음 삭제·새로고침한다.
+        if (cleanup) await cleanUp();
+        if (deleting) await deleteExtension(button.dataset.name, false);
+        else location.reload();
+    } catch (error) {
+        console.error('[Multi Avatar] 확장 정리 실패', error);
+        toastr.error('정리를 완료하지 못했습니다. 확장 삭제와 새로고침을 중단했습니다. 다시 시도해 주세요.', 'Multi Avatar');
+        refresh(); renderStrip();
+    } finally {
+        buttons.forEach(item => item.disabled = false);
+    }
+}
+
 function addSettings() {
     const html = `
     <div class="multi-avatar-settings">
@@ -1216,7 +1248,6 @@ function addImageDrawer(anchor, prefix) {
             </div>
             <div class="inline-drawer-content">
                 <div id="${prefix}_strip" class="ma-strip"></div>
-                <small>추가 이미지는 정지 PNG로 저장됩니다. GIF·WebP의 애니메이션은 유지되지 않습니다.</small>
             </div>
         </div>`);
 }
@@ -1231,6 +1262,13 @@ jQuery(async () => {
     }
 
     installImportGuard();
+    document.addEventListener('click', e => {
+        const button = e.target.closest?.('.extensions_info .extension_block .btn_clean, .extensions_info .extension_block .btn_delete');
+        if (!button || button.dataset.name?.split('/').at(-1) !== EXTENSION_NAME) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (!button.disabled) void runExtensionAction(button);
+    }, true);
     if (ctx().characters.length) pruneLibraries();
     addSettings();
     addImageDrawer(document.getElementById('avatar_div'), 'ma');
@@ -1357,6 +1395,11 @@ jQuery(async () => {
             if (!zi) continue;
             zi.src = src;
             zi.dataset.izoomifyUrl = src;
+            const container = z.querySelector('.zoomed_avatar_container');
+            if (container?.classList.contains('izoomify-in')) {
+                // 확대 플러그인은 초기화 시 주소를 저장하므로 기존 리스너를 해제한 뒤 다시 초기화한다.
+                jQuery(container).off('.izoomify izoomify.destroy').izoomify();
+            }
         }
     });
 
