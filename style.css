@@ -72,6 +72,9 @@ body.big-avatars .ma-picker {
     object-fit: cover;
     display: block;
     border-radius: inherit;
+    -webkit-touch-callout: none;
+    user-select: none;
+    touch-action: manipulation;
 }
 
 /* 캐릭터 기본값 표시 */
@@ -154,8 +157,8 @@ body.big-avatars .ma-picker {
     opacity: 1;
 }
 
-/* 터치·좁은 화면에서는 × 대신 길게 눌러 삭제한다. */
-@media (hover: none), (max-width: 1000px) {
+/* 터치 기기에서는 길게 누르는 삭제 동작을 제공한다. */
+@media (hover: none) and (pointer: coarse) {
     .ma-strip {
         --ma-gap: 8px;
     }
@@ -242,4 +245,16 @@ body.big-avatars .ma-picker {
     margin-top: 5px;
     font-size: 0.85em;
     opacity: 0.8;
+}
+
+.ma-progress {
+    padding: 24px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+}
+
+.ma-progress::backdrop {
+    background: rgba(0, 0, 0, 0.5);
 }
