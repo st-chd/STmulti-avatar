@@ -15,7 +15,14 @@ const isPersona = key => key.startsWith(PERSONA_PREFIX);
 const avatarFile = key => isPersona(key) ? key.slice(PERSONA_PREFIX.length) : key;
 const personaKey = file => `${PERSONA_PREFIX}${file}`;
 
-const ctx = () => SillyTavern.getContext();
+// getContext()는 호출마다 큰 객체를 새로 만들어, 동기 스캔 동안에는 한 번 받은 값을 재사용한다.
+let scanCtx = null;
+const ctx = () => scanCtx ?? SillyTavern.getContext();
+const withScanContext = fn => {
+    if (scanCtx) return fn();
+    scanCtx = SillyTavern.getContext();
+    try { return fn(); } finally { scanCtx = null; }
+};
 
 const charIndex = (key) => ctx().characters.findIndex(c => c?.avatar === key);
 let mutationTail = Promise.resolve();
@@ -417,27 +424,21 @@ function avatarKeyOf(src) {
     } catch { return null; }
 }
 
-/** 이미지 교체 전에 로드 가능 여부를 확인해 아바타가 사라지는 것을 막는다. */
-const probed = new Map();
-const originalImageErrors = new WeakMap();
-function probe(url) {
-    const cached = probed.get(url);
-    if (cached && cached.expires > Date.now()) return cached.promise;
+/** 불러오지 못한 추가 이미지. 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다. */
+const brokenImages = new Map();
+const isBroken = url => (brokenImages.get(url) ?? 0) > Date.now();
 
-    const entry = { expires: Date.now() + 300_000 };
-    const p = new Promise((res) => {
-        const t = new Image();
-        t.onload = () => res(true);
-        t.onerror = () => res(false);
-        t.src = url;
-    });
-    // 없는 파일은 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다.
-    p.then((ok) => { if (!ok) entry.expires = Date.now() + 30_000; });
-    entry.promise = p;
-    probed.delete(url);
-    if (probed.size >= 256) probed.delete(probed.keys().next().value);
-    probed.set(url, entry);
-    return p;
+// 본체의 채팅 아바타 오류 처리는 이미지를 '아바타 없음' 아이콘으로 바꿔 버리므로, 캡처 단계에서 먼저 받아 원본으로 되돌린다.
+const errorGuarded = new WeakSet();
+function onAppliedError(event) {
+    const img = event.currentTarget;
+    const applied = img.dataset.maApplied;
+    if (!applied || !sameUrl(img.getAttribute('src'), applied)) return;
+    event.stopImmediatePropagation();
+    brokenImages.set(applied, Date.now() + 30_000);
+    img.src = img.dataset.maOrig;
+    delete img.dataset.maApplied;
+    syncThemeVars(img, img.dataset.maOrig, originalUrl(img.dataset.maKey));
 }
 
 /** Moonlit Echoes 테마의 메시지 아바타 CSS 변수를 함께 갱신한다. */
@@ -472,7 +473,8 @@ function hydrateVisible(key) {
 }
 
 /** 목록 또는 채팅 규칙에 맞춰 아바타를 교체한다. */
-function swap(root, mode) {
+const swap = (root, mode) => withScanContext(() => swapNow(root, mode));
+function swapNow(root, mode) {
     if (!root) return;
     for (const img of root.querySelectorAll('.avatar img, #avatar_load_preview')) {
         // 원본 URL이 있으면 이름 변경에도 맞는 최신 키를 읽는다.
@@ -512,50 +514,33 @@ function swap(root, mode) {
         if (sameUrl(img.getAttribute('src'), wantUrl)) continue;
 
         if (!file) {
-            if (originalImageErrors.has(img)) {
-                img.onerror = originalImageErrors.get(img);
-                originalImageErrors.delete(img);
-            }
             img.src = img.dataset.maOrig;
             delete img.dataset.maApplied;
             syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
             continue;
         }
 
-        probe(wantUrl).then((ok) => {
-            // 대기 중 설정이나 요소가 바뀌면 적용하지 않는다.
-            if (!img.isConnected || img.dataset.maKey !== key || resolve(key, mode) !== file
-                || !sameUrl(img.getAttribute('src'), src) || sameUrl(img.getAttribute('src'), wantUrl)) return;
-            if (ok) {
-                img.dataset.maApplied = wantUrl;
-                if (!originalImageErrors.has(img)) originalImageErrors.set(img, img.onerror);
-                img.onerror = () => {
-                    img.onerror = originalImageErrors.get(img);
-                    originalImageErrors.delete(img);
-                    if (!sameUrl(img.getAttribute('src'), wantUrl)) return;
-                    probed.set(wantUrl, { promise: Promise.resolve(false), expires: Date.now() + 30_000 });
-                    img.src = img.dataset.maOrig;
-                    delete img.dataset.maApplied;
-                    syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
-                };
-                img.src = wantUrl;
-                syncThemeVars(img, wantUrl);
-            } else {
-                if (!sameUrl(img.getAttribute('src'), img.dataset.maOrig)) img.src = img.dataset.maOrig;
-                delete img.dataset.maApplied;
-                syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
-            }
-        });
+        if (isBroken(wantUrl)) {
+            if (!sameUrl(img.getAttribute('src'), img.dataset.maOrig)) img.src = img.dataset.maOrig;
+            delete img.dataset.maApplied;
+            syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
+            continue;
+        }
+
+        // 원본이 그려지기 전에 바로 교체하고, 불러오지 못하면 원본으로 되돌린다.
+        img.dataset.maApplied = wantUrl;
+        if (!errorGuarded.has(img)) {
+            errorGuarded.add(img);
+            img.addEventListener('error', onAppliedError, true);
+        }
+        img.src = wantUrl;
+        syncThemeVars(img, wantUrl);
     }
 }
 
 // 다음 렌더에서 원본 URL로 키를 다시 읽도록 표시를 지운다.
 function resetMarks() {
     for (const img of document.querySelectorAll('img[data-ma-key]')) {
-        if (originalImageErrors.has(img)) {
-            img.onerror = originalImageErrors.get(img);
-            originalImageErrors.delete(img);
-        }
         if (img.dataset.maOrig) img.src = img.dataset.maOrig;
         delete img.dataset.maKey;
         delete img.dataset.maOrig;
@@ -565,6 +550,10 @@ function resetMarks() {
 
 // 목록·채팅·편집창의 아바타와 채팅 버튼을 갱신한다.
 function refresh() {
+    withScanContext(refreshNow);
+}
+
+function refreshNow() {
     swap(document.getElementById('rm_print_characters_block'), 'list');
     swap(document.getElementById('avatar_div'), 'list');
     swap(document.getElementById('user_avatar_block'), 'list');
@@ -574,7 +563,8 @@ function refresh() {
 }
 
 /** 추가 이미지가 있는 메시지에만 선택 버튼을 표시한다. */
-function syncMesButtons(root) {
+const syncMesButtons = root => withScanContext(() => syncMesButtonsNow(root));
+function syncMesButtonsNow(root) {
     if (!root) return;
     const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
     for (const mes of list) {
@@ -653,9 +643,10 @@ function panelKey() {
     return id !== undefined && id !== null ? c.characters[id]?.avatar ?? null : null;
 }
 
-/** 터치 기기에서만 길게 누르는 삭제 동작을 사용한다. */
-const COMPACT_QUERY = '(hover: none) and (pointer: coarse)';
+/** 터치 기기에서만 길게 누르는 삭제 동작을 사용한다. 기기마다 hover/pointer 보고가 달라 조건을 넓게 잡는다. */
+const COMPACT_QUERY = '(hover: none), (pointer: coarse), (max-width: 1000px)';
 const isCompact = () => matchMedia(COMPACT_QUERY).matches;
+const isTouch = event => event.pointerType === 'touch' || event.pointerType === 'pen';
 
 /** 길게 눌렀을 때 뒤따르는 클릭을 막고 콜백을 실행한다. */
 function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 } = {}) {
@@ -664,7 +655,7 @@ function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 
     let origin;
     const start = event => {
         if (event.button !== 0) return;
-        if (!enabled()) return;
+        if (!isTouch(event) && !enabled()) return;
         clearTimeout(timer);
         fired = false;
         origin = [event.clientX, event.clientY];
@@ -682,13 +673,24 @@ function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 
     el.addEventListener('pointermove', event => {
         if (timer && origin && Math.hypot(event.clientX - origin[0], event.clientY - origin[1]) > 10) cancel();
     });
-    el.addEventListener('contextmenu', event => { if (enabled()) event.preventDefault(); });
     el.addEventListener('click', (e) => {
         if (!fired) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         fired = false;
     }, true);
+}
+
+/** 터치로 꾹 눌렀을 때 뜨는 이미지 공유·다운로드 메뉴와 드래그를 막는다. 마우스 우클릭 메뉴는 그대로 둔다. */
+function blockTouchMenu(strip) {
+    if (strip.dataset.maTouchMenu) return;
+    strip.dataset.maTouchMenu = '1';
+    let lastTouch = false;
+    strip.addEventListener('pointerdown', event => { lastTouch = isTouch(event); }, true);
+    strip.addEventListener('contextmenu', event => {
+        if (lastTouch || isTouch(event)) event.preventDefault();
+    });
+    strip.addEventListener('dragstart', event => { if (event.target instanceof HTMLImageElement) event.preventDefault(); });
 }
 
 function renderStrip() {
@@ -704,6 +706,7 @@ function renderPanelStrip(prefix, key) {
 
     if (drawer) drawer.style.display = key ? '' : 'none';
     if (!key) { strip.innerHTML = ''; return; }
+    blockTouchMenu(strip);
 
     const { files = [], list = null } = cardData(key) ?? {};
     if (count) count.textContent = files.length ? ` (${files.length})` : '';
@@ -891,7 +894,7 @@ async function deleteImage(key, file) {
         }
         await saveLocalSettings();
         await deleteUnreferencedImages(dir, [file], new Set([key]));
-        probed.clear();
+        brokenImages.clear();
 
         renderStrip();
         refresh();
@@ -1111,7 +1114,7 @@ async function purgeAll(log, scope = 'all') {
             let preserved = 0;
             for (const [dir, files] of plans) preserved += await deleteUnreferencedImages(dir, [...files], excludedKeys, references) ?? 0;
             await saveLocalSettings();
-            probed.clear();
+            brokenImages.clear();
             closePicker();
 
             const completed = scope === 'all' ? '모든 데이터 정리가 완료되었습니다.'
@@ -1227,7 +1230,7 @@ function addSettings() {
             console.error('[Multi Avatar] 정리 실패', e);
             status.textContent = '정리 중 오류가 발생했습니다. 일부 항목만 정리되었을 수 있습니다. 콘솔을 확인하세요.';
         } finally {
-            probed.clear();
+            brokenImages.clear();
             refresh();
             renderStrip();
             buttons.forEach(button => button.disabled = false);
@@ -1289,11 +1292,17 @@ jQuery(async () => {
     });
     for (const e of [event_types.CHAT_CHANGED, event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED, event_types.MESSAGE_SWIPED, event_types.MESSAGE_UPDATED]) {
-        eventSource.on(e, () => {
+        eventSource.on(e, (messageId) => {
             if (e === event_types.CHAT_CHANGED) closePicker();
             const chat = document.getElementById('chat');
-            swap(chat, 'chat');
-            syncMesButtons(chat);
+            // 메시지 단위 이벤트는 해당 메시지만 갱신해 긴 채팅에서 전체를 다시 훑지 않는다.
+            const id = Number(messageId);
+            const mes = e !== event_types.CHAT_CHANGED && messageId !== null && messageId !== '' && Number.isInteger(id)
+                ? chat?.querySelector(`.mes[mesid="${id}"]`) : null;
+            withScanContext(() => {
+                swap(mes ?? chat, 'chat');
+                syncMesButtons(mes ?? chat);
+            });
         });
     }
     eventSource.on(event_types.CHARACTER_EDITED, () => {
@@ -1308,7 +1317,7 @@ jQuery(async () => {
     if (event_types.PERSONA_DELETED) eventSource.on(event_types.PERSONA_DELETED, async ({ avatarId }) => {
         await handleAction(() => mutate(() => deletePersonaImages(avatarId)));
         if (chatOverride(personaKey(avatarId)) !== undefined) await handleAction(() => setChatOverride(personaKey(avatarId), undefined));
-        probed.clear();
+        brokenImages.clear();
         closePicker();
         refresh();
         renderStrip();
@@ -1371,6 +1380,27 @@ jQuery(async () => {
             }
             if (id === 'user_avatar_block') renderStrip();
         }).observe(el, { childList: true, subtree: id === 'user_avatar_block' });
+    }
+
+    // 스와이프는 기존 메시지를 제자리에서 다시 그려 아바타 src만 원본으로 되돌리므로, 생성이 끝나기 전에 바로 교체한다.
+    const chatEl = document.getElementById('chat');
+    if (chatEl) {
+        new MutationObserver((records) => {
+            const targets = new Set();
+            for (const r of records) {
+                // 확장이 직접 적용한 추가 이미지는 다시 훑지 않는다.
+                if (sameUrl(r.target.getAttribute?.('src'), r.target.dataset?.maApplied)) continue;
+                const mes = r.target.matches?.('.avatar img') && r.target.closest('.mes');
+                if (mes) targets.add(mes);
+            }
+            if (!targets.size) return;
+            withScanContext(() => {
+                for (const mes of targets) {
+                    swap(mes, 'chat');
+                    syncMesButtons(mes);
+                }
+            });
+        }).observe(chatEl, { subtree: true, attributes: true, attributeFilter: ['src'] });
     }
 
     document.addEventListener('click', (e) => {
