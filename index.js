@@ -417,28 +417,10 @@ function avatarKeyOf(src) {
     } catch { return null; }
 }
 
-/** 이미지 교체 전에 로드 가능 여부를 확인해 아바타가 사라지는 것을 막는다. */
-const probed = new Map();
+/** 불러오지 못한 추가 이미지. 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다. */
+const brokenImages = new Map();
 const originalImageErrors = new WeakMap();
-function probe(url) {
-    const cached = probed.get(url);
-    if (cached && cached.expires > Date.now()) return cached.promise;
-
-    const entry = { expires: Date.now() + 300_000 };
-    const p = new Promise((res) => {
-        const t = new Image();
-        t.onload = () => res(true);
-        t.onerror = () => res(false);
-        t.src = url;
-    });
-    // 없는 파일은 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다.
-    p.then((ok) => { if (!ok) entry.expires = Date.now() + 30_000; });
-    entry.promise = p;
-    probed.delete(url);
-    if (probed.size >= 256) probed.delete(probed.keys().next().value);
-    probed.set(url, entry);
-    return p;
-}
+const isBroken = url => (brokenImages.get(url) ?? 0) > Date.now();
 
 /** Moonlit Echoes 테마의 메시지 아바타 CSS 변수를 함께 갱신한다. */
 function syncThemeVars(img, thumb, original = thumb) {
@@ -522,30 +504,27 @@ function swap(root, mode) {
             continue;
         }
 
-        probe(wantUrl).then((ok) => {
-            // 대기 중 설정이나 요소가 바뀌면 적용하지 않는다.
-            if (!img.isConnected || img.dataset.maKey !== key || resolve(key, mode) !== file
-                || !sameUrl(img.getAttribute('src'), src) || sameUrl(img.getAttribute('src'), wantUrl)) return;
-            if (ok) {
-                img.dataset.maApplied = wantUrl;
-                if (!originalImageErrors.has(img)) originalImageErrors.set(img, img.onerror);
-                img.onerror = () => {
-                    img.onerror = originalImageErrors.get(img);
-                    originalImageErrors.delete(img);
-                    if (!sameUrl(img.getAttribute('src'), wantUrl)) return;
-                    probed.set(wantUrl, { promise: Promise.resolve(false), expires: Date.now() + 30_000 });
-                    img.src = img.dataset.maOrig;
-                    delete img.dataset.maApplied;
-                    syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
-                };
-                img.src = wantUrl;
-                syncThemeVars(img, wantUrl);
-            } else {
-                if (!sameUrl(img.getAttribute('src'), img.dataset.maOrig)) img.src = img.dataset.maOrig;
-                delete img.dataset.maApplied;
-                syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
-            }
-        });
+        if (isBroken(wantUrl)) {
+            if (!sameUrl(img.getAttribute('src'), img.dataset.maOrig)) img.src = img.dataset.maOrig;
+            delete img.dataset.maApplied;
+            syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
+            continue;
+        }
+
+        // 원본이 그려지기 전에 바로 교체하고, 불러오지 못하면 원본으로 되돌린다.
+        img.dataset.maApplied = wantUrl;
+        if (!originalImageErrors.has(img)) originalImageErrors.set(img, img.onerror);
+        img.onerror = () => {
+            img.onerror = originalImageErrors.get(img);
+            originalImageErrors.delete(img);
+            if (!sameUrl(img.getAttribute('src'), wantUrl)) return;
+            brokenImages.set(wantUrl, Date.now() + 30_000);
+            img.src = img.dataset.maOrig;
+            delete img.dataset.maApplied;
+            syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
+        };
+        img.src = wantUrl;
+        syncThemeVars(img, wantUrl);
     }
 }
 
@@ -653,9 +632,10 @@ function panelKey() {
     return id !== undefined && id !== null ? c.characters[id]?.avatar ?? null : null;
 }
 
-/** 터치 기기에서만 길게 누르는 삭제 동작을 사용한다. */
-const COMPACT_QUERY = '(hover: none) and (pointer: coarse)';
+/** 터치 기기에서만 길게 누르는 삭제 동작을 사용한다. 기기마다 hover/pointer 보고가 달라 조건을 넓게 잡는다. */
+const COMPACT_QUERY = '(hover: none), (pointer: coarse), (max-width: 1000px)';
 const isCompact = () => matchMedia(COMPACT_QUERY).matches;
+const isTouch = event => event.pointerType === 'touch' || event.pointerType === 'pen';
 
 /** 길게 눌렀을 때 뒤따르는 클릭을 막고 콜백을 실행한다. */
 function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 } = {}) {
@@ -664,7 +644,7 @@ function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 
     let origin;
     const start = event => {
         if (event.button !== 0) return;
-        if (!enabled()) return;
+        if (!isTouch(event) && !enabled()) return;
         clearTimeout(timer);
         fired = false;
         origin = [event.clientX, event.clientY];
@@ -682,13 +662,24 @@ function bindLongPress(el, onLongPress, { enabled = () => true, threshold = 500 
     el.addEventListener('pointermove', event => {
         if (timer && origin && Math.hypot(event.clientX - origin[0], event.clientY - origin[1]) > 10) cancel();
     });
-    el.addEventListener('contextmenu', event => { if (enabled()) event.preventDefault(); });
     el.addEventListener('click', (e) => {
         if (!fired) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         fired = false;
     }, true);
+}
+
+/** 터치로 꾹 눌렀을 때 뜨는 이미지 공유·다운로드 메뉴와 드래그를 막는다. 마우스 우클릭 메뉴는 그대로 둔다. */
+function blockTouchMenu(strip) {
+    if (strip.dataset.maTouchMenu) return;
+    strip.dataset.maTouchMenu = '1';
+    let lastTouch = false;
+    strip.addEventListener('pointerdown', event => { lastTouch = isTouch(event); }, true);
+    strip.addEventListener('contextmenu', event => {
+        if (lastTouch || isTouch(event) || isCompact()) event.preventDefault();
+    });
+    strip.addEventListener('dragstart', event => { if (event.target instanceof HTMLImageElement) event.preventDefault(); });
 }
 
 function renderStrip() {
@@ -704,6 +695,7 @@ function renderPanelStrip(prefix, key) {
 
     if (drawer) drawer.style.display = key ? '' : 'none';
     if (!key) { strip.innerHTML = ''; return; }
+    blockTouchMenu(strip);
 
     const { files = [], list = null } = cardData(key) ?? {};
     if (count) count.textContent = files.length ? ` (${files.length})` : '';
@@ -891,7 +883,7 @@ async function deleteImage(key, file) {
         }
         await saveLocalSettings();
         await deleteUnreferencedImages(dir, [file], new Set([key]));
-        probed.clear();
+        brokenImages.clear();
 
         renderStrip();
         refresh();
@@ -1111,7 +1103,7 @@ async function purgeAll(log, scope = 'all') {
             let preserved = 0;
             for (const [dir, files] of plans) preserved += await deleteUnreferencedImages(dir, [...files], excludedKeys, references) ?? 0;
             await saveLocalSettings();
-            probed.clear();
+            brokenImages.clear();
             closePicker();
 
             const completed = scope === 'all' ? '모든 데이터 정리가 완료되었습니다.'
@@ -1227,7 +1219,7 @@ function addSettings() {
             console.error('[Multi Avatar] 정리 실패', e);
             status.textContent = '정리 중 오류가 발생했습니다. 일부 항목만 정리되었을 수 있습니다. 콘솔을 확인하세요.';
         } finally {
-            probed.clear();
+            brokenImages.clear();
             refresh();
             renderStrip();
             buttons.forEach(button => button.disabled = false);
@@ -1308,7 +1300,7 @@ jQuery(async () => {
     if (event_types.PERSONA_DELETED) eventSource.on(event_types.PERSONA_DELETED, async ({ avatarId }) => {
         await handleAction(() => mutate(() => deletePersonaImages(avatarId)));
         if (chatOverride(personaKey(avatarId)) !== undefined) await handleAction(() => setChatOverride(personaKey(avatarId), undefined));
-        probed.clear();
+        brokenImages.clear();
         closePicker();
         refresh();
         renderStrip();
