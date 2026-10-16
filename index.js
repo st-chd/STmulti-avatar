@@ -15,7 +15,14 @@ const isPersona = key => key.startsWith(PERSONA_PREFIX);
 const avatarFile = key => isPersona(key) ? key.slice(PERSONA_PREFIX.length) : key;
 const personaKey = file => `${PERSONA_PREFIX}${file}`;
 
-const ctx = () => SillyTavern.getContext();
+// getContext()는 호출마다 큰 객체를 새로 만들어, 동기 스캔 동안에는 한 번 받은 값을 재사용한다.
+let scanCtx = null;
+const ctx = () => scanCtx ?? SillyTavern.getContext();
+const withScanContext = fn => {
+    if (scanCtx) return fn();
+    scanCtx = SillyTavern.getContext();
+    try { return fn(); } finally { scanCtx = null; }
+};
 
 const charIndex = (key) => ctx().characters.findIndex(c => c?.avatar === key);
 let mutationTail = Promise.resolve();
@@ -454,7 +461,8 @@ function hydrateVisible(key) {
 }
 
 /** 목록 또는 채팅 규칙에 맞춰 아바타를 교체한다. */
-function swap(root, mode) {
+const swap = (root, mode) => withScanContext(() => swapNow(root, mode));
+function swapNow(root, mode) {
     if (!root) return;
     for (const img of root.querySelectorAll('.avatar img, #avatar_load_preview')) {
         // 원본 URL이 있으면 이름 변경에도 맞는 최신 키를 읽는다.
@@ -544,6 +552,10 @@ function resetMarks() {
 
 // 목록·채팅·편집창의 아바타와 채팅 버튼을 갱신한다.
 function refresh() {
+    withScanContext(refreshNow);
+}
+
+function refreshNow() {
     swap(document.getElementById('rm_print_characters_block'), 'list');
     swap(document.getElementById('avatar_div'), 'list');
     swap(document.getElementById('user_avatar_block'), 'list');
@@ -553,7 +565,8 @@ function refresh() {
 }
 
 /** 추가 이미지가 있는 메시지에만 선택 버튼을 표시한다. */
-function syncMesButtons(root) {
+const syncMesButtons = root => withScanContext(() => syncMesButtonsNow(root));
+function syncMesButtonsNow(root) {
     if (!root) return;
     const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
     for (const mes of list) {
@@ -1281,11 +1294,17 @@ jQuery(async () => {
     });
     for (const e of [event_types.CHAT_CHANGED, event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED, event_types.MESSAGE_SWIPED, event_types.MESSAGE_UPDATED]) {
-        eventSource.on(e, () => {
+        eventSource.on(e, (messageId) => {
             if (e === event_types.CHAT_CHANGED) closePicker();
             const chat = document.getElementById('chat');
-            swap(chat, 'chat');
-            syncMesButtons(chat);
+            // 메시지 단위 이벤트는 해당 메시지만 갱신해 긴 채팅에서 전체를 다시 훑지 않는다.
+            const id = Number(messageId);
+            const mes = e !== event_types.CHAT_CHANGED && messageId !== null && messageId !== '' && Number.isInteger(id)
+                ? chat?.querySelector(`.mes[mesid="${id}"]`) : null;
+            withScanContext(() => {
+                swap(mes ?? chat, 'chat');
+                syncMesButtons(mes ?? chat);
+            });
         });
     }
     eventSource.on(event_types.CHARACTER_EDITED, () => {
