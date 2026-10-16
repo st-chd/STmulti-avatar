@@ -688,7 +688,7 @@ function blockTouchMenu(strip) {
     let lastTouch = false;
     strip.addEventListener('pointerdown', event => { lastTouch = isTouch(event); }, true);
     strip.addEventListener('contextmenu', event => {
-        if (lastTouch || isTouch(event) || isCompact()) event.preventDefault();
+        if (lastTouch || isTouch(event)) event.preventDefault();
     });
     strip.addEventListener('dragstart', event => { if (event.target instanceof HTMLImageElement) event.preventDefault(); });
 }
@@ -1388,6 +1388,8 @@ jQuery(async () => {
         new MutationObserver((records) => {
             const targets = new Set();
             for (const r of records) {
+                // 확장이 직접 적용한 추가 이미지는 다시 훑지 않는다.
+                if (sameUrl(r.target.getAttribute?.('src'), r.target.dataset?.maApplied)) continue;
                 const mes = r.target.matches?.('.avatar img') && r.target.closest('.mes');
                 if (mes) targets.add(mes);
             }
