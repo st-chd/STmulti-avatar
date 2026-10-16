@@ -426,8 +426,20 @@ function avatarKeyOf(src) {
 
 /** 불러오지 못한 추가 이미지. 렌더마다 재요청하지 않고 30초 뒤 다음 렌더에서 재확인한다. */
 const brokenImages = new Map();
-const originalImageErrors = new WeakMap();
 const isBroken = url => (brokenImages.get(url) ?? 0) > Date.now();
+
+// 본체의 채팅 아바타 오류 처리는 이미지를 '아바타 없음' 아이콘으로 바꿔 버리므로, 캡처 단계에서 먼저 받아 원본으로 되돌린다.
+const errorGuarded = new WeakSet();
+function onAppliedError(event) {
+    const img = event.currentTarget;
+    const applied = img.dataset.maApplied;
+    if (!applied || !sameUrl(img.getAttribute('src'), applied)) return;
+    event.stopImmediatePropagation();
+    brokenImages.set(applied, Date.now() + 30_000);
+    img.src = img.dataset.maOrig;
+    delete img.dataset.maApplied;
+    syncThemeVars(img, img.dataset.maOrig, originalUrl(img.dataset.maKey));
+}
 
 /** Moonlit Echoes 테마의 메시지 아바타 CSS 변수를 함께 갱신한다. */
 function syncThemeVars(img, thumb, original = thumb) {
@@ -502,10 +514,6 @@ function swapNow(root, mode) {
         if (sameUrl(img.getAttribute('src'), wantUrl)) continue;
 
         if (!file) {
-            if (originalImageErrors.has(img)) {
-                img.onerror = originalImageErrors.get(img);
-                originalImageErrors.delete(img);
-            }
             img.src = img.dataset.maOrig;
             delete img.dataset.maApplied;
             syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
@@ -521,16 +529,10 @@ function swapNow(root, mode) {
 
         // 원본이 그려지기 전에 바로 교체하고, 불러오지 못하면 원본으로 되돌린다.
         img.dataset.maApplied = wantUrl;
-        if (!originalImageErrors.has(img)) originalImageErrors.set(img, img.onerror);
-        img.onerror = () => {
-            img.onerror = originalImageErrors.get(img);
-            originalImageErrors.delete(img);
-            if (!sameUrl(img.getAttribute('src'), wantUrl)) return;
-            brokenImages.set(wantUrl, Date.now() + 30_000);
-            img.src = img.dataset.maOrig;
-            delete img.dataset.maApplied;
-            syncThemeVars(img, img.dataset.maOrig, originalUrl(key));
-        };
+        if (!errorGuarded.has(img)) {
+            errorGuarded.add(img);
+            img.addEventListener('error', onAppliedError, true);
+        }
         img.src = wantUrl;
         syncThemeVars(img, wantUrl);
     }
@@ -539,10 +541,6 @@ function swapNow(root, mode) {
 // 다음 렌더에서 원본 URL로 키를 다시 읽도록 표시를 지운다.
 function resetMarks() {
     for (const img of document.querySelectorAll('img[data-ma-key]')) {
-        if (originalImageErrors.has(img)) {
-            img.onerror = originalImageErrors.get(img);
-            originalImageErrors.delete(img);
-        }
         if (img.dataset.maOrig) img.src = img.dataset.maOrig;
         delete img.dataset.maKey;
         delete img.dataset.maOrig;
@@ -1382,6 +1380,25 @@ jQuery(async () => {
             }
             if (id === 'user_avatar_block') renderStrip();
         }).observe(el, { childList: true, subtree: id === 'user_avatar_block' });
+    }
+
+    // 스와이프는 기존 메시지를 제자리에서 다시 그려 아바타 src만 원본으로 되돌리므로, 생성이 끝나기 전에 바로 교체한다.
+    const chatEl = document.getElementById('chat');
+    if (chatEl) {
+        new MutationObserver((records) => {
+            const targets = new Set();
+            for (const r of records) {
+                const mes = r.target.matches?.('.avatar img') && r.target.closest('.mes');
+                if (mes) targets.add(mes);
+            }
+            if (!targets.size) return;
+            withScanContext(() => {
+                for (const mes of targets) {
+                    swap(mes, 'chat');
+                    syncMesButtons(mes);
+                }
+            });
+        }).observe(chatEl, { subtree: true, attributes: true, attributeFilter: ['src'] });
     }
 
     document.addEventListener('click', (e) => {
