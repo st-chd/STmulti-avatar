@@ -123,7 +123,8 @@ function sanitizeCard(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
     const files = [...new Set(Array.isArray(data.files) ? data.files.filter(validPathPart) : [])];
     return { files, list: files.includes(data.list) ? data.list : null,
-        ...(validPathPart(data.dir) ? { dir: data.dir } : {}) };
+        ...(validPathPart(data.dir) ? { dir: data.dir } : {}),
+        ...(data.random === true && files.length ? { random: true } : {}) };
 }
 
 function ownedImages() {
@@ -708,7 +709,7 @@ function renderPanelStrip(prefix, key) {
     if (!key) { strip.innerHTML = ''; return; }
     blockTouchMenu(strip);
 
-    const { files = [], list = null } = cardData(key) ?? {};
+    const { files = [], list = null, random = false } = cardData(key) ?? {};
     if (count) count.textContent = files.length ? ` (${files.length})` : '';
     strip.innerHTML = '';
 
@@ -744,6 +745,16 @@ function renderPanelStrip(prefix, key) {
         strip.append(tile);
     }
 
+    if (files.length) {
+        const dice = document.createElement('div');
+        dice.className = 'ma-tile ma-random fa-solid fa-dice' + (random ? ' on' : '');
+        dice.title = random
+            ? '랜덤 켜짐\n새 채팅마다 원본을 포함한 이미지 중 하나를 골라 그 채팅에 고정합니다.\n클릭하면 끕니다.'
+            : '랜덤 꺼짐\n클릭하면 새 채팅마다 원본을 포함한 이미지 중 하나를 골라 그 채팅에 고정합니다.';
+        dice.onclick = () => handleAction(() => setRandom(key, !random));
+        strip.append(dice);
+    }
+
     const plus = document.createElement('div');
     plus.className = 'ma-tile ma-add fa-solid fa-plus';
     plus.title = '이미지 추가';
@@ -760,6 +771,49 @@ async function setListImage(key, file) {
         const d = existing ?? { files: [] };
         await writeCard(key, { ...d, list: file });
         renderStrip();
+        refresh();
+    });
+}
+
+async function setRandom(key, on) {
+    return mutate(async () => {
+        await loadLibrary(key);
+        const d = cardData(key);
+        if (!d?.files.length) throw new Error('추가 이미지가 없습니다.');
+        if (!!d.random === on) return;
+        const { random, ...rest } = d;
+        await writeCard(key, on ? { ...rest, random: true } : rest);
+        renderStrip();
+    });
+}
+
+/** 새 채팅을 만들 때 랜덤을 켠 캐릭터·페르소나마다 원본을 포함해 한 장을 뽑아 그 채팅에 고정한다. */
+async function rollNewChat() {
+    const target = currentChatTarget();
+    if (!target) return;
+    const c = ctx();
+    const members = c.groupId ? c.groups?.find(g => g.id === c.groupId)?.members ?? [] : [c.characters[c.characterId]?.avatar];
+    const keys = [...members.filter(Boolean), ...(user_avatar ? [personaKey(user_avatar)] : [])];
+    return mutate(async () => {
+        if (!sameChat(target, currentChatTarget())) return;
+        const previous = { ...(ctx().chatMetadata?.[KEY] ?? {}) };
+        const map = { ...previous };
+        let changed = false;
+        for (const key of keys) {
+            if (chatKeys(key).some(candidate => Object.hasOwn(map, candidate))) continue;
+            await loadLibrary(key).catch(() => {});
+            const d = cardData(key);
+            if (!d?.random || !d.files.length) continue;
+            const pool = ['', ...d.files];
+            map[key] = pool[Math.floor(Math.random() * pool.length)];
+            changed = true;
+        }
+        if (!changed || !sameChat(target, currentChatTarget())) return;
+        replaceChatMap(map);
+        try { await saveCurrentMetadata(target); } catch (error) {
+            if (sameChat(target, currentChatTarget())) replaceChatMap(previous);
+            throw error;
+        }
         refresh();
     });
 }
@@ -1305,6 +1359,13 @@ jQuery(async () => {
             });
         });
     }
+    for (const event of [event_types.CHAT_CREATED, event_types.GROUP_CHAT_CREATED]) {
+        if (event) eventSource.on(event, () => handleAction(rollNewChat));
+    }
+    // 첫 메시지가 없는 캐릭터는 새 채팅 이벤트가 오지 않아 빈 채팅을 열 때 뽑는다.
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        if (ctx().chat?.length === 0) void handleAction(rollNewChat);
+    });
     eventSource.on(event_types.CHARACTER_EDITED, () => {
         const key = panelKey();
         if (key) libraries.delete(key);
