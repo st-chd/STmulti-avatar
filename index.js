@@ -810,11 +810,12 @@ async function rollNewChat() {
         }
         if (!changed || !sameChat(target, currentChatTarget())) return;
         replaceChatMap(map);
+        // 첫 메시지가 기본 이미지로 보이는 시간을 줄이려고 저장 왕복보다 먼저 표시한다.
+        refresh();
         try { await saveCurrentMetadata(target); } catch (error) {
-            if (sameChat(target, currentChatTarget())) replaceChatMap(previous);
+            if (sameChat(target, currentChatTarget())) { replaceChatMap(previous); refresh(); }
             throw error;
         }
-        refresh();
     });
 }
 
