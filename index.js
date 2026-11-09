@@ -321,6 +321,36 @@ const chatOverride = key => {
     return storedKey === undefined ? undefined : map[storedKey];
 };
 
+// 새 채팅 첫 렌더에서 미리 뽑은 이미지. 저장은 CHAT_CREATED가 맡고, 그 전까지는 화면에만 쓴다.
+let pending = null; // { id, picks: Map<key, file>, claimed }
+const settledChats = new Set(); // 이번 세션에서 렌더가 끝난 채팅. 다시 열 때는 새로 뽑지 않는다.
+let freshGroupChat = null;
+const currentChatId = () => ctx().chatId ?? ctx().getCurrentChatId?.();
+
+/** 방금 만든 채팅인지. 그룹은 첫 메시지 이벤트로, 1:1은 첫 메시지 시각으로 판단한다. */
+function isFreshChat(id) {
+    const c = ctx();
+    if (c.groupId) return freshGroupChat === id;
+    const chat = c.chat;
+    if (chat?.length !== 1 || chat[0]?.is_user) return false;
+    const t = Date.parse(chat[0].send_date);
+    return Number.isFinite(t) && Math.abs(Date.now() - t) < 60_000;
+}
+
+function pendingPick(key) {
+    const id = currentChatId();
+    if (!id) return undefined;
+    if (pending?.id === id && pending.picks.has(key)) return pending.picks.get(key);
+    if (settledChats.has(id) || isPersona(key) || !isFreshChat(id)) return undefined;
+    const d = cardData(key);
+    if (!d?.random || !d.files.length) return undefined;
+    if (pending?.id !== id) pending = { id, picks: new Map(), claimed: false };
+    const pool = ['', ...d.files];
+    const file = pool[Math.floor(Math.random() * pool.length)];
+    pending.picks.set(key, file);
+    return file;
+}
+
 async function setChatOverride(key, value) {
     const target = currentChatTarget();
     return mutate(async () => {
@@ -357,6 +387,11 @@ function resolve(key, mode) {
         const ov = chatOverride(key);
         if (ov === '') return null;
         if (alive(ov)) return ov;
+        if (ov === undefined) {
+            const pick = pendingPick(key);
+            if (pick === '') return null;
+            if (alive(pick)) return pick;
+        }
     }
     return alive(card?.list) ? card.list : null;
 }
@@ -495,8 +530,7 @@ function swapNow(root, mode) {
         }
 
         const mes = img.closest('.mes');
-        if (mes && (mes.getAttribute('is_system') === 'true'
-            || (mes.getAttribute('is_user') === 'true') !== isPersona(key))) {
+        if (mes && (mes.getAttribute('is_user') === 'true') !== isPersona(key)) {
             delete img.dataset.maKey;
             delete img.dataset.maOrig;
             delete img.dataset.maApplied;
@@ -570,7 +604,7 @@ function syncMesButtonsNow(root) {
     const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
     for (const mes of list) {
         const key = mes.querySelector('.avatar img')?.dataset.maKey;
-        const wanted = !!key && mes.getAttribute('is_system') !== 'true'
+        const wanted = !!key
             && (mes.getAttribute('is_user') === 'true') === isPersona(key)
             && !!cardData(key)?.files?.length;
         const btn = mes.querySelector('.ma-btn');
@@ -804,10 +838,13 @@ async function rollNewChat() {
             await loadLibrary(key).catch(() => {});
             const d = cardData(key);
             if (!d?.random || !d.files.length) continue;
+            // 첫 렌더에서 이미 보여준 이미지가 있으면 그대로 저장해 바뀌지 않게 한다.
+            const shown = pending?.id === target.id ? pending.picks.get(key) : undefined;
             const pool = ['', ...d.files];
-            map[key] = pool[Math.floor(Math.random() * pool.length)];
+            map[key] = shown !== undefined && pool.includes(shown) ? shown : pool[Math.floor(Math.random() * pool.length)];
             changed = true;
         }
+        if (pending?.id === target.id) pending = null;
         if (!changed || !sameChat(target, currentChatTarget())) return;
         replaceChatMap(map);
         // 첫 메시지가 기본 이미지로 보이는 시간을 줄이려고 저장 왕복보다 먼저 표시한다.
@@ -817,6 +854,27 @@ async function rollNewChat() {
             throw error;
         }
     });
+}
+
+// 랜덤 후보를 미리 받아 두어 새 채팅에서 뽑힌 이미지가 바로 보이게 한다.
+const preloaded = new Map();
+function preloadRandom() {
+    const c = ctx();
+    const members = c.groupId ? c.groups?.find(g => g.id === c.groupId)?.members ?? [] : [c.characters[c.characterId]?.avatar];
+    const keys = [...members.filter(Boolean), ...(user_avatar ? [personaKey(user_avatar)] : [])];
+    for (const key of keys) {
+        const d = cardData(key);
+        if (!d?.random) continue;
+        for (const file of d.files) {
+            const url = imgUrl(key, file);
+            if (preloaded.has(url) || isBroken(url)) continue;
+            if (preloaded.size >= 100) preloaded.delete(preloaded.keys().next().value);
+            const img = new Image();
+            img.decoding = 'async';
+            img.src = url;
+            preloaded.set(url, img);
+        }
+    }
 }
 
 const readAsDataUrl = (file) => new Promise((res, rej) => {
@@ -1348,7 +1406,13 @@ jQuery(async () => {
     for (const e of [event_types.CHAT_CHANGED, event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED, event_types.MESSAGE_SWIPED, event_types.MESSAGE_UPDATED]) {
         eventSource.on(e, (messageId) => {
-            if (e === event_types.CHAT_CHANGED) closePicker();
+            if (e === event_types.CHAT_CHANGED) {
+                closePicker();
+                // 렌더가 끝난 채팅에서는 더 이상 새로 뽑지 않는다.
+                const id = currentChatId();
+                if (id) settledChats.add(id);
+                preloadRandom();
+            }
             const chat = document.getElementById('chat');
             // 메시지 단위 이벤트는 해당 메시지만 갱신해 긴 채팅에서 전체를 다시 훑지 않는다.
             const id = Number(messageId);
@@ -1361,8 +1425,23 @@ jQuery(async () => {
         });
     }
     for (const event of [event_types.CHAT_CREATED, event_types.GROUP_CHAT_CREATED]) {
-        if (event) eventSource.on(event, () => handleAction(rollNewChat));
+        if (event) eventSource.on(event, () => {
+            if (pending && pending.id === currentChatId()) pending.claimed = true;
+            return handleAction(rollNewChat);
+        });
     }
+    // 새 그룹 채팅은 첫 메시지 이벤트가 렌더보다 먼저 온다. 기존 채팅을 불러올 때는 오지 않는다.
+    eventSource.on(event_types.MESSAGE_RECEIVED, (messageId, type) => {
+        if (type !== 'first_message' || !ctx().groupId) return;
+        if (document.querySelector(`#chat .mes[mesid="${Number(messageId)}"]`)) return;
+        freshGroupChat = currentChatId() ?? null;
+    });
+    // 새 채팅이 아니었으면(CHAT_CREATED 없이 불러오기가 끝나면) 임시로 뽑은 이미지를 버린다.
+    eventSource.on(event_types.CHAT_LOADED, () => {
+        if (!pending || pending.id !== currentChatId() || pending.claimed) return;
+        pending = null;
+        refresh();
+    });
     // 첫 메시지가 없는 캐릭터는 새 채팅 이벤트가 오지 않아 빈 채팅을 열 때 뽑는다.
     eventSource.on(event_types.CHAT_CHANGED, () => {
         if (ctx().chat?.length === 0) void handleAction(rollNewChat);
