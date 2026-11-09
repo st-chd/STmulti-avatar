@@ -193,6 +193,24 @@ body.big-avatars .ma-picker {
     border: 2px dashed var(--SmartThemeBorderColor);
 }
 
+/* 새 채팅 랜덤 토글. 기본 이미지 표시(금색)와 구분한다 */
+.ma-tile.ma-random {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--SmartThemeBorderColor);
+    font-size: 1.4em;
+    opacity: 0.5;
+}
+
+.ma-tile.ma-random:hover,
+.ma-tile.ma-random.on {
+    border-style: solid;
+    border-color: var(--SmartThemeQuoteColor);
+    color: var(--SmartThemeQuoteColor);
+    opacity: 1;
+}
+
 /* 채팅 이미지 선택창 */
 .ma-picker {
     position: fixed;

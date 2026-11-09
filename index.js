@@ -123,7 +123,8 @@ function sanitizeCard(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
     const files = [...new Set(Array.isArray(data.files) ? data.files.filter(validPathPart) : [])];
     return { files, list: files.includes(data.list) ? data.list : null,
-        ...(validPathPart(data.dir) ? { dir: data.dir } : {}) };
+        ...(validPathPart(data.dir) ? { dir: data.dir } : {}),
+        ...(data.random === true && files.length ? { random: true } : {}) };
 }
 
 function ownedImages() {
@@ -216,9 +217,14 @@ function withChatLock(action) {
     return result;
 }
 
+function currentChatId() {
+    const c = ctx();
+    return c.chatId ?? c.getCurrentChatId?.();
+}
+
 function currentChatTarget() {
     const c = ctx();
-    const id = c.chatId ?? c.getCurrentChatId?.();
+    const id = currentChatId();
     if (!id) return null;
     return c.groupId ? { group: true, id } : { group: false, avatar: c.characters[c.characterId]?.avatar, id };
 }
@@ -320,6 +326,78 @@ const chatOverride = key => {
     return storedKey === undefined ? undefined : map[storedKey];
 };
 
+/*
+ * 새 채팅 랜덤 상태. 아래 함수들만 바꾼다.
+ * 본체는 첫 메시지를 그린 뒤에야 CHAT_CREATED를 보내므로, 첫 렌더에서 미리 뽑아 화면에만 쓰고
+ * 저장은 CHAT_CREATED 뒤 rollNewChat이 맡는다. 이벤트가 안 오고 불러오기가 끝나면 버린다.
+ */
+let firstRenderPicks = null; // { chatId, files: Map<key, file>, created }
+const settledChats = new Set(); // 이번 세션에서 렌더가 끝난 채팅. 다시 열 때는 새로 뽑지 않는다.
+let freshGroupChatId = null;
+
+/** 랜덤 후보는 원본('')과 추가 이미지 전부. */
+function pickRandom(files) {
+    const pool = ['', ...files];
+    return pool[Math.floor(Math.random() * pool.length)];
+}
+
+/** 현재 채팅의 캐릭터(그룹이면 멤버 전원)와 페르소나 키. */
+function currentChatKeys() {
+    const c = ctx();
+    const members = c.groupId ? c.groups?.find(g => g.id === c.groupId)?.members ?? [] : [c.characters[c.characterId]?.avatar];
+    return [...members.filter(Boolean), ...(user_avatar ? [personaKey(user_avatar)] : [])];
+}
+
+/** 방금 만든 채팅인지. 그룹은 첫 메시지 이벤트로, 1:1은 첫 메시지 시각으로 판단한다. */
+function isFreshChat(id) {
+    const c = ctx();
+    if (c.groupId) return freshGroupChatId === id;
+    const chat = c.chat;
+    if (chat?.length !== 1 || chat[0]?.is_user) return false;
+    const t = Date.parse(chat[0].send_date);
+    return Number.isFinite(t) && Math.abs(Date.now() - t) < 60_000;
+}
+
+function firstRenderPick(key) {
+    const id = currentChatId();
+    if (!id) return undefined;
+    if (firstRenderPicks?.chatId === id && firstRenderPicks.files.has(key)) return firstRenderPicks.files.get(key);
+    if (settledChats.has(id) || !isFreshChat(id)) return undefined;
+    const d = cardData(key);
+    if (!d?.random || !d.files.length) return undefined;
+    if (firstRenderPicks?.chatId !== id) firstRenderPicks = { chatId: id, files: new Map(), created: false };
+    const file = pickRandom(d.files);
+    firstRenderPicks.files.set(key, file);
+    return file;
+}
+
+/** 새 그룹 채팅은 첫 메시지 이벤트가 렌더보다 먼저 온다. 기존 채팅을 불러올 때는 오지 않는다. */
+function markFreshGroupChat(messageId, type) {
+    if (type !== 'first_message' || !ctx().groupId) return;
+    if (document.querySelector(`#chat .mes[mesid="${Number(messageId)}"]`)) return;
+    freshGroupChatId = currentChatId() ?? null;
+}
+
+function onRandomChatChanged() {
+    const id = currentChatId();
+    if (id) settledChats.add(id);
+    preloadRandom();
+    // 첫 메시지가 없는 캐릭터는 CHAT_CREATED가 오지 않는다. 본체에서 빈 채팅은 새 채팅과 구분되지 않아 열 때 뽑는다.
+    if (ctx().chat?.length === 0) void handleAction(rollNewChat);
+}
+
+function onRandomChatCreated() {
+    if (firstRenderPicks?.chatId === currentChatId()) firstRenderPicks.created = true;
+    return handleAction(rollNewChat);
+}
+
+/** CHAT_CREATED 없이 불러오기가 끝났으면 새 채팅이 아니므로 미리 뽑은 이미지를 버린다. */
+function onRandomChatLoaded() {
+    if (firstRenderPicks?.chatId !== currentChatId() || firstRenderPicks.created) return;
+    firstRenderPicks = null;
+    refresh();
+}
+
 async function setChatOverride(key, value) {
     const target = currentChatTarget();
     return mutate(async () => {
@@ -356,6 +434,11 @@ function resolve(key, mode) {
         const ov = chatOverride(key);
         if (ov === '') return null;
         if (alive(ov)) return ov;
+        if (ov === undefined) {
+            const pick = firstRenderPick(key);
+            if (pick === '') return null;
+            if (alive(pick)) return pick;
+        }
     }
     return alive(card?.list) ? card.list : null;
 }
@@ -494,8 +577,7 @@ function swapNow(root, mode) {
         }
 
         const mes = img.closest('.mes');
-        if (mes && (mes.getAttribute('is_system') === 'true'
-            || (mes.getAttribute('is_user') === 'true') !== isPersona(key))) {
+        if (mes && (mes.getAttribute('is_user') === 'true') !== isPersona(key)) {
             delete img.dataset.maKey;
             delete img.dataset.maOrig;
             delete img.dataset.maApplied;
@@ -569,7 +651,7 @@ function syncMesButtonsNow(root) {
     const list = root.matches?.('.mes') ? [root] : root.querySelectorAll('.mes');
     for (const mes of list) {
         const key = mes.querySelector('.avatar img')?.dataset.maKey;
-        const wanted = !!key && mes.getAttribute('is_system') !== 'true'
+        const wanted = !!key
             && (mes.getAttribute('is_user') === 'true') === isPersona(key)
             && !!cardData(key)?.files?.length;
         const btn = mes.querySelector('.ma-btn');
@@ -708,7 +790,7 @@ function renderPanelStrip(prefix, key) {
     if (!key) { strip.innerHTML = ''; return; }
     blockTouchMenu(strip);
 
-    const { files = [], list = null } = cardData(key) ?? {};
+    const { files = [], list = null, random = false } = cardData(key) ?? {};
     if (count) count.textContent = files.length ? ` (${files.length})` : '';
     strip.innerHTML = '';
 
@@ -744,6 +826,16 @@ function renderPanelStrip(prefix, key) {
         strip.append(tile);
     }
 
+    if (files.length) {
+        const dice = document.createElement('div');
+        dice.className = 'ma-tile ma-random fa-solid fa-dice' + (random ? ' on' : '');
+        dice.title = random
+            ? '랜덤 켜짐\n새 채팅마다 원본을 포함한 이미지 중 하나를 골라 그 채팅에 고정합니다.\n클릭하면 끕니다.'
+            : '랜덤 꺼짐\n클릭하면 새 채팅마다 원본을 포함한 이미지 중 하나를 골라 그 채팅에 고정합니다.';
+        dice.onclick = () => handleAction(() => setRandom(key, !random));
+        strip.append(dice);
+    }
+
     const plus = document.createElement('div');
     plus.className = 'ma-tile ma-add fa-solid fa-plus';
     plus.title = '이미지 추가';
@@ -762,6 +854,68 @@ async function setListImage(key, file) {
         renderStrip();
         refresh();
     });
+}
+
+async function setRandom(key, on) {
+    return mutate(async () => {
+        await loadLibrary(key);
+        const d = cardData(key);
+        if (!d?.files.length) throw new Error('추가 이미지가 없습니다.');
+        if (!!d.random === on) return;
+        const { random, ...rest } = d;
+        await writeCard(key, on ? { ...rest, random: true } : rest);
+        renderStrip();
+    });
+}
+
+/** 새 채팅을 만들 때 랜덤을 켠 캐릭터·페르소나마다 원본을 포함해 한 장을 뽑아 그 채팅에 고정한다. */
+async function rollNewChat() {
+    const target = currentChatTarget();
+    if (!target) return;
+    const keys = currentChatKeys();
+    return mutate(async () => {
+        if (!sameChat(target, currentChatTarget())) return;
+        const previous = { ...(ctx().chatMetadata?.[KEY] ?? {}) };
+        const map = { ...previous };
+        let changed = false;
+        for (const key of keys) {
+            if (chatKeys(key).some(candidate => Object.hasOwn(map, candidate))) continue;
+            await loadLibrary(key).catch(() => {});
+            const d = cardData(key);
+            if (!d?.random || !d.files.length) continue;
+            // 첫 렌더에서 이미 보여준 이미지가 있으면 그대로 저장해 바뀌지 않게 한다.
+            const shown = firstRenderPicks?.chatId === target.id ? firstRenderPicks.files.get(key) : undefined;
+            map[key] = shown === '' || d.files.includes(shown) ? shown : pickRandom(d.files);
+            changed = true;
+        }
+        if (firstRenderPicks?.chatId === target.id) firstRenderPicks = null;
+        if (!changed || !sameChat(target, currentChatTarget())) return;
+        replaceChatMap(map);
+        // 첫 메시지가 기본 이미지로 보이는 시간을 줄이려고 저장 왕복보다 먼저 표시한다.
+        refresh();
+        try { await saveCurrentMetadata(target); } catch (error) {
+            if (sameChat(target, currentChatTarget())) { replaceChatMap(previous); refresh(); }
+            throw error;
+        }
+    });
+}
+
+// 랜덤 후보를 미리 받아 두어 새 채팅에서 뽑힌 이미지가 바로 보이게 한다.
+const preloaded = new Map();
+function preloadRandom() {
+    for (const key of currentChatKeys()) {
+        const d = cardData(key);
+        if (!d?.random) continue;
+        for (const file of d.files) {
+            const url = imgUrl(key, file);
+            if (preloaded.has(url) || isBroken(url)) continue;
+            if (preloaded.size >= 100) preloaded.delete(preloaded.keys().next().value);
+            const img = new Image();
+            img.decoding = 'async';
+            img.src = url;
+            preloaded.set(url, img);
+        }
+    }
 }
 
 const readAsDataUrl = (file) => new Promise((res, rej) => {
@@ -1293,7 +1447,10 @@ jQuery(async () => {
     for (const e of [event_types.CHAT_CHANGED, event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED, event_types.MESSAGE_SWIPED, event_types.MESSAGE_UPDATED]) {
         eventSource.on(e, (messageId) => {
-            if (e === event_types.CHAT_CHANGED) closePicker();
+            if (e === event_types.CHAT_CHANGED) {
+                closePicker();
+                onRandomChatChanged();
+            }
             const chat = document.getElementById('chat');
             // 메시지 단위 이벤트는 해당 메시지만 갱신해 긴 채팅에서 전체를 다시 훑지 않는다.
             const id = Number(messageId);
@@ -1305,6 +1462,11 @@ jQuery(async () => {
             });
         });
     }
+    for (const event of [event_types.CHAT_CREATED, event_types.GROUP_CHAT_CREATED]) {
+        if (event) eventSource.on(event, onRandomChatCreated);
+    }
+    eventSource.on(event_types.MESSAGE_RECEIVED, markFreshGroupChat);
+    eventSource.on(event_types.CHAT_LOADED, onRandomChatLoaded);
     eventSource.on(event_types.CHARACTER_EDITED, () => {
         const key = panelKey();
         if (key) libraries.delete(key);
