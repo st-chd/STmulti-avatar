@@ -1,4 +1,7 @@
 # STmulti-avatar (멀티 아바타)
+|캐릭터 목록|채팅방|
+|---|---|
+|<img src="https://raw.githubusercontent.com/st-chd/chd-asset/refs/heads/main/Asset-MultiAvatar/Multi-1.webp">|<img src="https://raw.githubusercontent.com/st-chd/chd-asset/refs/heads/main/Asset-MultiAvatar/Multi-2.webp"> |
 
 캐릭터와 페르소나에 여러 이미지를 등록하고, 목록과 채팅방에서 각각 다른 이미지를 표시하는 실리태번 확장입니다.
 
