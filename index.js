@@ -5,11 +5,23 @@
 
 import { user_avatar } from '../../../personas.js';
 import { isGenerating, saveSettings } from '../../../../script.js';
-import { deleteExtension } from '../../../extensions.js';
+import { deleteExtension, extensionTypes } from '../../../extensions.js';
+import { isAdmin } from '../../../user.js';
 
 const KEY = 'multiAvatar';
 const EXTENSION_NAME = decodeURIComponent(new URL(import.meta.url).pathname.split('/').at(-2));
 const IMG_ROOT = 'user/images';
+// 본체 기본 아바타 저장 크기(src/constants.js AVATAR_WIDTH/HEIGHT)와 같게 맞춘다.
+const AVATAR_WIDTH = 512;
+const AVATAR_HEIGHT = 768;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_PIXELS = 32_000_000;
+const TOO_LARGE = '파일 용량이 너무 큽니다.';
+const safeDecode = value => { try { return decodeURIComponent(value); } catch { return value; } };
+// 업로드 응답 경로는 #과 ?만 인코딩되고 서버는 이미지 경로를 두 번 디코딩하므로 폴더·파일명에 # % ?를 쓰지 않는다.
+const safeName = value => value.replace(/[#%?]/g, '_');
+// 1.3.0까지는 # 이 든 폴더명을 인코딩된 채로 저장했으므로 디코딩한 값으로 비교한다.
+const sameDir = (a, b) => typeof a === 'string' && typeof b === 'string' && safeDecode(a) === safeDecode(b);
 const PERSONA_PREFIX = 'persona:';
 const isPersona = key => key.startsWith(PERSONA_PREFIX);
 const avatarFile = key => isPersona(key) ? key.slice(PERSONA_PREFIX.length) : key;
@@ -36,13 +48,15 @@ const handleAction = action => action().catch(error => {
     toastr.error(error.message || '이미지 설정을 저장하지 못했습니다.', 'Multi Avatar');
     refresh(); renderStrip();
 });
+// shallow 카드에서 받아 둔 추가 이미지 정보. 본체는 목록을 새로 불러올 때마다 캐릭터 객체를 새로 만들므로
+// 아바타 파일명으로 기억하고, 카드가 바뀌는 경로(저장·불러오기·편집·이름 변경·삭제)에서 직접 지운다.
 const libraries = new Map();
 const libraryLoads = new Map();
 const libraryFailures = new Map();
 
-function cacheLibrary(key, data, source) {
+function cacheLibrary(key, data) {
     data = sanitizeCard(data);
-    libraries.set(key, { data, source });
+    libraries.set(key, { data });
     const settings = ctx().extensionSettings[KEY] ??= {};
     if (data) {
         if (JSON.stringify(settings.index?.[key]) === JSON.stringify(data)) return;
@@ -69,7 +83,8 @@ function pruneLibraries() {
     if (renamed) {
         let changed = false;
         for (const [oldAvatar, newAvatar] of Object.entries(renamed)) {
-            if (!alive.has(newAvatar)) { delete renamed[oldAvatar]; changed = true; }
+            // 이전 이름으로 새 캐릭터가 생기면 그 캐릭터의 선택과 섞이지 않도록 연결을 끊는다.
+            if (!alive.has(newAvatar) || alive.has(oldAvatar)) { delete renamed[oldAvatar]; changed = true; }
         }
         if (!Object.keys(renamed).length) delete ctx().extensionSettings[KEY].renamed;
         if (changed) ctx().saveSettingsDebounced();
@@ -90,12 +105,12 @@ async function loadLibrary(key, force = false) {
     const character = ctx().characters.find(ch => ch?.avatar === key);
     if (!character) return null;
     if (!character.shallow) return cardData(key);
-    if (!force && libraries.get(key)?.source === character) return libraries.get(key).data;
+    if (!force && libraries.has(key)) return libraries.get(key).data;
     if (libraryLoads.has(key)) return libraryLoads.get(key);
     const loading = cleanupRequest('/api/characters/get', { avatar_url: key }).then(full => {
         if (!full || full.shallow || full.avatar !== key) throw new Error('캐릭터 데이터를 불러오지 못했습니다.');
         const data = sanitizeCard(full.data?.extensions?.[KEY]);
-        if (ctx().characters.includes(character) && !deletedCharacters.has(character)) cacheLibrary(key, data, character);
+        if (ctx().characters.some(ch => ch?.avatar === key) && !deletedCharacters.has(character)) cacheLibrary(key, data);
         return data;
     }).catch(error => { libraryFailures.set(key, Date.now() + 30_000); throw error; })
         .finally(() => libraryLoads.delete(key));
@@ -105,12 +120,15 @@ async function loadLibrary(key, force = false) {
 
 async function saveLocalSettings() {
     const expected = JSON.stringify(ctx().extensionSettings[KEY] ?? null);
-    await saveSettings();
-    const result = await cleanupRequest('/api/settings/get', {});
-    const saved = JSON.parse(result?.settings ?? 'null');
-    if (JSON.stringify(saved?.extension_settings?.[KEY] ?? null) !== expected) {
-        throw new Error('추가 이미지 설정을 서버에 저장하지 못했습니다. 이미지 파일은 보존했습니다.');
+    // 본체 saveSettings는 응답 생성 중 등에는 저장하지 않고 돌아오므로 한 번 더 시도한다.
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt) await new Promise(resolve => setTimeout(resolve, 1000));
+        await saveSettings();
+        const result = await cleanupRequest('/api/settings/get', {});
+        const saved = JSON.parse(result?.settings ?? 'null');
+        if (JSON.stringify(saved?.extension_settings?.[KEY] ?? null) === expected) return;
     }
+    throw new Error('추가 이미지 설정을 서버에 저장하지 못했습니다. 이미지 파일은 보존했습니다.');
 }
 
 const escapeHtml = value => String(value).replace(/[&<>"']/g,
@@ -136,16 +154,16 @@ function ownedImages() {
 
 function isOwnedImage(dir, file) {
     const owned = ctx().extensionSettings[KEY]?.owned;
-    return Array.isArray(owned) && owned.some(record => record?.dir === dir && Array.isArray(record.files) && record.files.includes(file));
+    return Array.isArray(owned) && owned.some(record => sameDir(record?.dir, dir) && Array.isArray(record.files) && record.files.includes(file));
 }
 
 function rememberOwned(dir, files, key) {
     const kind = key ? (isPersona(key) ? 'persona' : 'character') : undefined;
     const settings = ctx().extensionSettings[KEY] ??= {};
-    const existing = ownedImages().find(item => item.dir === dir && item.kind === kind);
+    const existing = ownedImages().find(item => sameDir(item.dir, dir) && item.kind === kind);
     if (existing && files.every(file => existing.files.includes(file))) return;
     const owned = settings.owned = ownedImages().map(record => ({ ...record, files: [...record.files] }));
-    const record = owned.find(item => item.dir === dir && item.kind === kind);
+    const record = owned.find(item => sameDir(item.dir, dir) && item.kind === kind);
     if (record) record.files = [...new Set([...record.files, ...files])];
     else owned.push({ dir, files: [...new Set(files)], ...(kind ? { kind } : {}) });
 }
@@ -171,7 +189,7 @@ function cardData(key) {
     if (isPersona(key)) return sanitizeCard(ctx().extensionSettings[KEY]?.personas?.[avatarFile(key)]);
     const c = ctx().characters.find(x => x?.avatar === key);
     if (c?.shallow) {
-        if (libraries.get(key)?.source === c) return libraries.get(key).data;
+        if (libraries.has(key)) return libraries.get(key).data;
         const index = ctx().extensionSettings[KEY]?.index;
         return sanitizeCard(index && Object.hasOwn(index, key) ? index[key] : null);
     }
@@ -202,7 +220,7 @@ async function writeCard(key, data) {
         ? [...(result.updated ?? []), ...(result.skipped ?? [])] : result.updated ?? []).includes(key)) {
         throw new Error('캐릭터 이미지 설정을 저장하지 못했습니다. 이미지 파일은 보존했습니다.');
     }
-    cacheLibrary(key, data, ctx().characters[charIndex(key)]);
+    cacheLibrary(key, data);
 }
 
 let importGuardCleanup = null;
@@ -259,9 +277,11 @@ function installImportGuard() {
         }
         if (active && url.origin === location.origin && ['/api/characters/delete', '/api/characters/rename'].includes(url.pathname)
             && typeof options?.body === 'string') {
-            const avatar = JSON.parse(options.body).avatar_url;
-            await mutationTail;
-            const character = ctx().characters.find(ch => ch?.avatar === avatar);
+            let avatar;
+            try { avatar = JSON.parse(options.body).avatar_url; } catch { /* 본체 형식이 아니면 사전 로드만 건너뛴다. */ }
+            // 진행 중인 저장을 기다리되, 큐가 막혀도 본체의 삭제·이름 변경은 멈추지 않게 한다.
+            await Promise.race([mutationTail, new Promise(resolve => setTimeout(resolve, 10_000))]);
+            const character = avatar && ctx().characters.find(ch => ch?.avatar === avatar);
             if (character) {
                 try { deletedLibraries.set(character, await loadLibrary(avatar, true)); }
                 catch (error) { toastr.warning('추가 이미지 정보를 읽지 못해 이미지 파일은 보존합니다.', 'Multi Avatar'); }
@@ -460,7 +480,9 @@ function imageDir(key, d) {
 }
 
 // 테마가 경로 표기를 바꿔도 반복 교체되지 않도록 절대 경로를 사용한다.
-const imgUrl = (key, file) => `/${IMG_ROOT}/${encodeURIComponent(dirOf(key))}/${encodeURIComponent(file)}`;
+// 본체의 채팅 태그 표시(tags.js)는 아바타 주소의 file 값으로 캐릭터를 찾으므로 원본 파일명을 남긴다.
+const imgUrl = (key, file) => `/${IMG_ROOT}/${encodeURIComponent(dirOf(key))}/${encodeURIComponent(file)}`
+    + `?file=${encodeURIComponent(avatarFile(key))}`;
 
 /** 같은 리소스를 가리키는 URL인지 경로와 검색 문자열만 비교한다. */
 function sameUrl(a, b) {
@@ -550,7 +572,7 @@ function scheduleRefresh() {
 
 function hydrateVisible(key) {
     const character = ctx().characters.find(ch => ch?.avatar === key);
-    if (!character?.shallow || libraries.get(key)?.source === character || libraryLoads.has(key)
+    if (!character?.shallow || libraries.has(key) || libraryLoads.has(key)
         || libraryFailures.get(key) > Date.now()) return;
     loadLibrary(key).then(scheduleRefresh).catch(error => console.error('[Multi Avatar] 이미지 정보 로드 실패', error));
 }
@@ -932,36 +954,109 @@ const loadImage = (src) => new Promise((res, rej) => {
     i.src = src;
 });
 
-/** 자른 이미지를 투명도를 보존한 PNG Base64로 만든다. */
-async function cropToPng(dataUrl, crop) {
-    const img = await loadImage(dataUrl);
-    const w = Math.round(crop?.width || img.naturalWidth);
-    const h = Math.round(crop?.height || img.naturalHeight);
-    if (w * h > 32_000_000) throw new Error('이미지가 너무 큽니다. 3,200만 화소 이하의 이미지를 사용해 주세요.');
+function drawStep(source, sx, sy, sw, sh, w, h) {
     const canvas = document.createElement('canvas');
     canvas.width = w;
     canvas.height = h;
-    canvas.getContext('2d').drawImage(img, crop?.x || 0, crop?.y || 0, w, h, 0, 0, w, h);
-    return canvas.toDataURL('image/png').split(',')[1];
+    const g = canvas.getContext('2d');
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(source, sx, sy, sw, sh, 0, 0, w, h);
+    return canvas;
 }
+
+/**
+ * 크롭 영역을 투명도를 보존한 PNG Base64로 만든다.
+ * 본체 기본 아바타처럼 크기 조정을 켠 경우 512×768을 채우도록 가운데 기준으로 맞춰 줄인다.
+ */
+function encodeImage(img, crop, resize) {
+    let x = crop?.x || 0;
+    let y = crop?.y || 0;
+    let w = crop?.width || img.naturalWidth;
+    let h = crop?.height || img.naturalHeight;
+    let targetW = Math.round(w);
+    let targetH = Math.round(h);
+    if (resize) {
+        const scale = Math.max(AVATAR_WIDTH / w, AVATAR_HEIGHT / h);
+        x += (w - AVATAR_WIDTH / scale) / 2;
+        y += (h - AVATAR_HEIGHT / scale) / 2;
+        w = AVATAR_WIDTH / scale;
+        h = AVATAR_HEIGHT / scale;
+        targetW = AVATAR_WIDTH;
+        targetH = AVATAR_HEIGHT;
+    }
+    // 한 번에 크게 줄이면 픽셀을 건너뛰어 테두리가 거칠어지므로 절반씩 나눠 줄인다.
+    let source = img;
+    while (w / 2 >= targetW && h / 2 >= targetH) {
+        const nextW = Math.round(w / 2);
+        const nextH = Math.round(h / 2);
+        source = drawStep(source, x, y, w, h, nextW, nextH);
+        x = 0;
+        y = 0;
+        w = nextW;
+        h = nextH;
+    }
+    return drawStep(source, x, y, w, h, targetW, targetH).toDataURL('image/png').split(',')[1];
+}
+
+let picking = null;
 
 function pickFile() {
     return new Promise((res) => {
         const input = Object.assign(document.createElement('input'), { type: 'file', accept: 'image/*' });
-        const finish = file => { input.remove(); res(file); };
+        const state = { focused: false, cancel: () => finish(null) };
+        const onFocus = () => { state.focused = true; };
+        const finish = file => {
+            if (picking !== state) return;
+            picking = null;
+            window.removeEventListener('focus', onFocus);
+            input.remove();
+            res(file);
+        };
+        picking = state;
         input.hidden = true;
         input.onchange = () => finish(input.files?.[0] ?? null);
         input.oncancel = () => finish(null);
         document.body.append(input);
+        window.addEventListener('focus', onFocus);
         input.click();
     });
 }
 
+/** 업로드할 PNG Base64를 만든다. 크롭 창이 사용자 입력을 기다리므로 저장 큐 밖에서 실행한다. */
+async function prepareImage(file) {
+    if (file.size > MAX_FILE_BYTES) throw new Error(TOO_LARGE);
+    const dataUrl = await readAsDataUrl(file);
+    const img = await loadImage(dataUrl).catch(() => { throw new Error('이미지를 읽을 수 없습니다.'); });
+    const resize = !ctx().powerUserSettings.never_resize_avatars;
+    if (!resize && img.naturalWidth * img.naturalHeight > MAX_PIXELS) throw new Error(TOO_LARGE);
+
+    let crop;
+    if (resize) {
+        const { Popup, POPUP_TYPE } = ctx();
+        const dlg = new Popup('이미지 자르기', POPUP_TYPE.CROP, '', { cropImage: dataUrl });
+        if (!await dlg.show()) return null;
+        crop = dlg.cropData;
+    }
+    return encodeImage(img, crop, resize);
+}
+
+let uploading = false;
+
 async function addImage(key) {
     if (uploading) return;
-    uploading = true;
+    if (picking) {
+        // 취소 이벤트를 보내지 않는 브라우저는 선택창이 닫혀도 대기가 남으므로, 포커스가 돌아온 뒤 다시 누르면 새로 연다.
+        if (!picking.focused) return;
+        picking.cancel();
+    }
     try {
-        await uploadImage(key);
+        // 파일 선택은 클릭 처리 안에서 바로 열어야 브라우저가 막지 않는다.
+        const file = await pickFile();
+        if (!file) return;
+        uploading = true;
+        const image = await prepareImage(file);
+        if (image) await mutate(() => saveImage(key, image));
     } catch (error) {
         console.error('[Multi Avatar] 업로드 실패', error);
         toastr.error(error.message || '이미지 업로드에 실패했습니다.');
@@ -970,57 +1065,41 @@ async function addImage(key) {
     }
 }
 
-let uploading = false;
+async function saveImage(key, image) {
+    await loadLibrary(key);
+    if (!isPersona(key) && charIndex(key) < 0) throw new Error('캐릭터가 삭제되었습니다.');
+    const d = cardData(key) ?? { files: [], list: null };
+    const dir = d.files.length ? safeDecode(dirOf(key))
+        : `multi-avatar_${isPersona(key) ? 'persona_' : ''}${safeName(avatarFile(key).replace(/\.[^.]+$/, ''))}`;
+    assertPathPart(dir);
+    const base = safeName(dir).replace(/\./g, '_');
 
-async function uploadImage(key) {
-    return mutate(async () => {
-        const file = await pickFile();
-        if (!file) return;
-        if (file.size > 20 * 1024 * 1024) throw new Error('20MB 이하의 이미지 파일을 사용해 주세요.');
-
-        const { Popup, POPUP_TYPE } = ctx();
-        const dataUrl = await readAsDataUrl(file);
-
-        let crop;
-        if (!ctx().powerUserSettings.never_resize_avatars) {
-            const dlg = new Popup('이미지 자르기', POPUP_TYPE.CROP, '', { cropImage: dataUrl });
-            if (!await dlg.show()) return;
-            crop = dlg.cropData;
-        }
-
-        await loadLibrary(key);
-        if (!isPersona(key) && charIndex(key) < 0) throw new Error('캐릭터가 삭제되었습니다.');
-        const d = cardData(key) ?? { files: [], list: null };
-        const dir = d.files.length ? dirOf(key) : `multi-avatar_${isPersona(key) ? 'persona_' : ''}${avatarFile(key).replace(/\.[^.]+$/, '')}`;
-        assertPathPart(dir);
-        const base = dir.replace(/\./g, '_');
-
-        const res = await fetch('/api/images/upload', {
-            method: 'POST',
-            headers: ctx().getRequestHeaders(),
-            body: JSON.stringify({
-                image: await cropToPng(dataUrl, crop),
-                format: 'png',
-                // 삭제 후 같은 경로를 재사용하면 브라우저가 이전 크롭 이미지를 보여줄 수 있다.
-                filename: `${base}_add1_${ctx().uuidv4()}`,
-                ch_name: dir,
-            }),
-        });
-        if (!res.ok) throw new Error('이미지 업로드에 실패했습니다.');
-
-        const uploadedPath = (await res.json()).path;
-        const path = typeof uploadedPath === 'string' ? uploadedPath.replace(/^\/(?=user\/images\/)/, '').split('/') : null;
-        if (path?.length !== 4 || path[0] !== 'user' || path[1] !== 'images'
-            || !validPathPart(path[2]) || !validPathPart(path[3])) throw new Error('업로드 경로가 올바르지 않습니다.');
-        const saved = path[3];
-        rememberOwned(path[2], [saved], key);
-        await saveLocalSettings();
-        const latest = cardData(key) ?? { files: [], list: null };
-        if (latest.files.length && imageDir(key, latest) !== path[2]) throw new Error('이미지 폴더가 변경되었습니다. 다시 시도해 주세요.');
-        await writeCard(key, { ...latest, dir: path[2], files: [...latest.files, saved] });
-        renderStrip();
-        refresh();
+    const res = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify({
+            image,
+            format: 'png',
+            // 삭제 후 같은 경로를 재사용하면 브라우저가 이전 크롭 이미지를 보여줄 수 있다.
+            filename: `${base}_add1_${ctx().uuidv4()}`,
+            ch_name: dir,
+        }),
     });
+    if (!res.ok) throw new Error('이미지 업로드에 실패했습니다.');
+
+    const uploadedPath = (await res.json()).path;
+    const path = typeof uploadedPath === 'string'
+        ? uploadedPath.replace(/^\/(?=user\/images\/)/, '').split('/').map(safeDecode) : null;
+    if (path?.length !== 4 || path[0] !== 'user' || path[1] !== 'images'
+        || !validPathPart(path[2]) || !validPathPart(path[3])) throw new Error('업로드 경로가 올바르지 않습니다.');
+    const saved = path[3];
+    rememberOwned(path[2], [saved], key);
+    await saveLocalSettings();
+    const latest = cardData(key) ?? { files: [], list: null };
+    if (latest.files.length && safeDecode(imageDir(key, latest)) !== path[2]) throw new Error('이미지 폴더가 변경되었습니다. 다시 시도해 주세요.');
+    await writeCard(key, { ...latest, dir: path[2], files: [...latest.files, saved] });
+    renderStrip();
+    refresh();
 }
 
 async function deleteImage(key, file) {
@@ -1059,7 +1138,7 @@ async function deleteImage(key, file) {
 async function deleteFolder(dir, files) {
     assertPathPart(dir);
     for (const file of files ?? []) assertPathPart(file);
-    const allowed = new Set(ownedImages().filter(record => record.dir === dir).flatMap(record => record.files));
+    const allowed = new Set(ownedImages().filter(record => sameDir(record.dir, dir)).flatMap(record => record.files));
     const deleted = new Set();
     let preserved = 0;
     try {
@@ -1076,7 +1155,7 @@ async function deleteFolder(dir, files) {
     } finally {
         const settings = ctx().extensionSettings[KEY];
         if (deleted.size && settings?.owned) {
-            settings.owned = ownedImages().map(record => record.dir === dir
+            settings.owned = ownedImages().map(record => sameDir(record.dir, dir)
                 ? { ...record, files: record.files.filter(file => !deleted.has(file)) } : record).filter(record => record.files.length);
             if (!settings.owned.length) delete settings.owned;
             if (!Object.keys(settings).length) delete ctx().extensionSettings[KEY];
@@ -1096,17 +1175,22 @@ function assertPathPart(value) {
 
 const deletedCharacters = new WeakSet();
 
-/** PNG 재불러오기로 공유된 파일은 다른 카드나 페르소나가 사용하는 동안 보존한다. */
-async function referenceIndex(excludedKeys) {
-    const pending = ctx().characters.filter(ch => ch?.shallow && !deletedCharacters.has(ch) && !excludedKeys.has(ch.avatar));
-    let next = 0;
-    await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
-        while (next < pending.length) await loadLibrary(pending[next++].avatar);
-    }));
+/**
+ * PNG 재불러오기로 공유된 파일은 다른 카드나 페르소나가 사용하는 동안 보존한다.
+ * shallow 카드를 모두 받는 것은 전체 정리에서만 한다. 단건 삭제는 저장된 index로 충분하다.
+ */
+async function referenceIndex(excludedKeys, { loadShallow = false } = {}) {
+    if (loadShallow) {
+        const pending = ctx().characters.filter(ch => ch?.shallow && !deletedCharacters.has(ch) && !excludedKeys.has(ch.avatar));
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
+            while (next < pending.length) await loadLibrary(pending[next++].avatar);
+        }));
+    }
     const referenced = new Map();
     const collect = (key, data) => {
         if (excludedKeys.has(key) || !data?.files?.length) return;
-        const dir = imageDir(key, data);
+        const dir = safeDecode(imageDir(key, data));
         if (!referenced.has(dir)) referenced.set(dir, new Set());
         for (const file of data.files) referenced.get(dir).add(file);
     };
@@ -1120,7 +1204,7 @@ async function referenceIndex(excludedKeys) {
 async function deleteUnreferencedImages(dir, files, excludedKeys, references) {
     if (!files?.length) return;
     references ??= await referenceIndex(excludedKeys);
-    return deleteFolder(dir, files.filter(file => !references.get(dir)?.has(file)));
+    return deleteFolder(dir, files.filter(file => !references.get(safeDecode(dir))?.has(file)));
 }
 
 /** 캐릭터 카드에 등록된 추가 이미지를 삭제한다. */
@@ -1196,7 +1280,7 @@ async function purgeAll(log, scope = 'all') {
         }
         const report = message => { log(message); if (dialog) dialog.textContent = message; };
         try {
-            if (scope !== 'persona') await referenceIndex(new Set());
+            if (scope !== 'persona') await referenceIndex(new Set(), { loadShallow: true });
             const chars = ctx().characters ?? [];
             const excludedKeys = new Set([
                 ...(scope !== 'persona' ? chars.map(ch => ch.avatar) : []),
@@ -1207,16 +1291,17 @@ async function purgeAll(log, scope = 'all') {
             const plan = (key, data) => {
                 if (!data?.files.length) return;
                 adoptLegacyImages(key, data);
-                const dir = imageDir(key, data);
+                const dir = safeDecode(imageDir(key, data));
                 plans.set(dir, new Set([...(plans.get(dir) ?? []), ...data.files]));
             };
             if (scope !== 'persona') for (const ch of chars) plan(ch.avatar, cardData(ch.avatar));
             if (scope !== 'character') for (const [file, data] of Object.entries(c.extensionSettings[KEY]?.personas ?? {})) plan(personaKey(file), sanitizeCard(data));
             for (const record of ownedImages()) {
                 if (scope !== 'all' && record.kind !== scope) continue;
-                plans.set(record.dir, new Set([...(plans.get(record.dir) ?? []), ...record.files]));
+                const dir = safeDecode(record.dir);
+                plans.set(dir, new Set([...(plans.get(dir) ?? []), ...record.files]));
             }
-            const references = await referenceIndex(excludedKeys);
+            const references = await referenceIndex(excludedKeys, { loadShallow: true });
             report('이미지 설정 저장 중...');
             if (scope !== 'persona') {
                 await purgeCards();
@@ -1239,6 +1324,13 @@ async function purgeAll(log, scope = 'all') {
                 }
                 throw error;
             }
+
+            // 본체 정리 훅은 5초 뒤 새로고침하므로, 채팅 수에 비례해 오래 걸리는 채팅 정리보다 파일 삭제를 먼저 끝낸다.
+            report('이미지 파일 삭제 중...');
+            let preserved = 0;
+            for (const [dir, files] of plans) preserved += await deleteUnreferencedImages(dir, [...files], excludedKeys, references) ?? 0;
+            await saveLocalSettings();
+            brokenImages.clear();
 
             let done = 0;
             for (const ch of chars) {
@@ -1264,11 +1356,6 @@ async function purgeAll(log, scope = 'all') {
                 replaceChatMap(current.chat_metadata[KEY] ?? {});
                 await saveCurrentMetadata(currentChatTarget());
             }
-            report('이미지 파일 삭제 중...');
-            let preserved = 0;
-            for (const [dir, files] of plans) preserved += await deleteUnreferencedImages(dir, [...files], excludedKeys, references) ?? 0;
-            await saveLocalSettings();
-            brokenImages.clear();
             closePicker();
 
             const completed = scope === 'all' ? '모든 데이터 정리가 완료되었습니다.'
@@ -1289,7 +1376,7 @@ async function cleanStoredChat(target, scope) {
         if (!stripMeta(chat, scope)) return;
         const latest = await cleanupRequest(chatGet(target), body, fetcher);
         if (sameChat(target, currentChatTarget()) || JSON.stringify(latest) !== snapshot) {
-            throw new Error('정리 중 채팅 내용이 변경되었습니다. 이미지 파일은 보존했습니다. 다시 시도해 주세요.');
+            throw new Error('정리 중 채팅 내용이 변경되었습니다. 다시 시도해 주세요.');
         }
         const url = target.group ? '/api/chats/group/save' : '/api/chats/save';
         await cleanupRequest(url, { ...body, chat }, fetcher);
@@ -1332,6 +1419,26 @@ async function runExtensionAction(button) {
     }
 }
 
+/** purgeAll이 지울 대상과 같은 기준으로 센다. shallow 카드는 저장된 index를 쓴다. */
+function countImages(scope) {
+    const files = new Set();
+    const add = (dir, list) => { for (const file of list) files.add(`${safeDecode(dir)}/${file}`); };
+    if (scope !== 'persona') {
+        for (const ch of ctx().characters ?? []) {
+            const data = ch?.avatar && cardData(ch.avatar);
+            if (data?.files.length) add(imageDir(ch.avatar, data), data.files);
+        }
+    }
+    if (scope !== 'character') {
+        for (const [file, raw] of Object.entries(ctx().extensionSettings[KEY]?.personas ?? {})) {
+            const data = sanitizeCard(raw);
+            if (data?.files.length) add(imageDir(personaKey(file), data), data.files);
+        }
+    }
+    for (const record of ownedImages()) if (scope === 'all' || record.kind === scope) add(record.dir, record.files);
+    return files.size;
+}
+
 function addSettings() {
     const html = `
     <div class="multi-avatar-settings">
@@ -1365,10 +1472,7 @@ function addSettings() {
         ['ma_purge_character', 'character', '캐릭터 이미지 정리', '모든 캐릭터의'],
     ];
     for (const [id, scope, title, target] of actions) document.getElementById(id).onclick = async () => {
-        const chars = scope === 'persona' ? [] : ctx().characters ?? [];
-        const personas = scope === 'character' ? [] : Object.values(ctx().extensionSettings[KEY]?.personas ?? {});
-        const total = chars.reduce((n, x) => n + (x?.data?.extensions?.[KEY]?.files?.length ?? 0), 0)
-            + personas.reduce((n, x) => n + (x.files?.length ?? 0), 0);
+        const total = countImages(scope);
         const buttons = actions.map(([buttonId]) => document.getElementById(buttonId));
         const status = document.getElementById('ma_purge_status');
         buttons.forEach(button => button.disabled = true);
@@ -1412,6 +1516,9 @@ function addImageDrawer(anchor, prefix) {
 jQuery(async () => {
     const { eventSource, event_types } = ctx();
 
+    // 꺼진 확장도 본체 정리 훅이 모듈을 불러오면 이 코드가 실행되므로 UI와 감시를 설치하지 않는다.
+    if (ctx().extensionSettings.disabledExtensions?.includes(`third-party/${EXTENSION_NAME}`)) return;
+
     if (typeof ctx().writeExtensionFieldBulk !== 'function' || typeof ctx().updateChatMetadata !== 'function'
         || typeof ctx().constants?.unset !== 'string') {
         toastr.error('Multi Avatar에 필요한 API가 없습니다. SillyTavern을 업데이트해 주세요.');
@@ -1422,6 +1529,9 @@ jQuery(async () => {
     document.addEventListener('click', e => {
         const button = e.target.closest?.('.extensions_info .extension_block .btn_clean, .extensions_info .extension_block .btn_delete');
         if (!button || button.dataset.name?.split('/').at(-1) !== EXTENSION_NAME) return;
+        // 관리자가 아니면 전역 확장 삭제는 본체가 막고 안내하므로 가로채지 않는다.
+        const isGlobal = Object.entries(extensionTypes).some(([id, type]) => id.endsWith(`/${EXTENSION_NAME}`) && type === 'global');
+        if (button.classList.contains('btn_delete') && isGlobal && !isAdmin()) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         if (!button.disabled) void runExtensionAction(button);
@@ -1514,7 +1624,7 @@ jQuery(async () => {
                 const data = { ...d, dir: imageDir(oldAvatar, d) };
                 const result = await ctx().writeExtensionFieldBulk([newAvatar], KEY, data);
                 if (!result?.updated?.includes(newAvatar)) throw new Error('이름 변경 후 이미지 설정을 저장하지 못했습니다.');
-                cacheLibrary(newAvatar, data, undefined);
+                cacheLibrary(newAvatar, data);
             }
             libraries.delete(oldAvatar);
             const settings = ctx().extensionSettings[KEY] ??= {};
